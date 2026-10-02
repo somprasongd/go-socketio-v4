@@ -25,7 +25,7 @@ Socket.IO v4 + Engine.IO v4 server implementation สำหรับ Go — **�
 | M4 engine.io compliance harness (official suite) | #4 | ✅ เสร็จ — 24/24 ผ่าน |
 | M5 socket.io parser v5 (text + binary attachments) | #5 | ✅ เสร็จ |
 | M6 socket.io server core: nsp/rooms/ack/broadcast | #6 | ✅ เสร็จ |
-| M7 public API + http.Handler wiring + e2e | #7 | 🔲 รอทำ |
+| M7 public API + http.Handler wiring + e2e | #7 | ✅ เสร็จ |
 | M8 JS interop tests (socket.io-client v4 จริง) | #8 | 🔲 รอทำ |
 | M9 docs + example + สรุปสถานะ | #9 | 🔲 รอทำ |
 
@@ -143,7 +143,16 @@ git init, go.mod (`github.com/somprasongd/go-socketio-v4`, go 1.27), MIT LICENSE
 - **เกณฑ์ตรวจ:** unit test ผ่าน fake engine.io conn — connect/auth, event+ack,
   broadcast ตาม room, disconnect สะอาด
 
-### M7 — public API + wiring (issue #7)
+### M7 — public API + wiring (issue #7) ✅
+
+> เสร็จ: `New(opts)` ต่อ engine.io (OnSession/OnMessage/OnClose → core),
+> `Server.ServeHTTP` mount ได้ที่ path ใดก็ได้ (แนะนำ /socket.io/),
+> `EngineIO()` เผื่อปรับแต่งชั้นล่าง
+> e2e: client จริง (gorilla) พูด wire packets ผ่านทั้งสอง transport —
+> connect → push → event+ack → binary ขาเข้า/ออก → broadcast → disconnect;
+> บทเรียน: socket.io packet ต้องห่อใน engine.io MESSAGE ("40" ไม่ใช่ "0")
+> ซึ่ง client ดิบที่ส่งผิดถูก server ปฏิเสธถูกต้องตาม spec
+> ตรวจแล้ว: e2e 2 tests + `go test -race` + vet + gofmt เขียวทั้งหมด
 
 - Root package `socketio`: `New()`, OnConnect/OnDisconnect/OnEvent/OnError,
   Socket.Emit/Join/Leave/Rooms/Broadcast/Disconnect, mount ที่ `/socket.io/`,

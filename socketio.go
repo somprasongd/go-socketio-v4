@@ -7,6 +7,8 @@ package socketio
 
 import (
 	"sync"
+
+	"github.com/somprasongd/go-socketio-v4/engineio"
 )
 
 // sendSink is the slice of an engine.io session the socket.io layer sends
@@ -21,12 +23,14 @@ type sendSink interface {
 }
 
 // Server is a Socket.IO v4 endpoint: a set of namespaces fed by engine.io
-// sessions. Wire it to a transport with the wiring in server_http.go
-// (New does it) and register handlers on its namespaces before serving.
+// sessions. Construct with New, which wires the engine.io transport, then
+// register handlers on its namespaces before serving.
 type Server struct {
 	mu      sync.Mutex
 	nsps    map[string]*Namespace
 	clients map[sendSink]*client
+
+	eio *engineio.Server
 }
 
 // newServer creates the server core with its default ("/") namespace.
