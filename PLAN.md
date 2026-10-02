@@ -20,7 +20,7 @@ Socket.IO v4 + Engine.IO v4 server implementation สำหรับ Go — **�
 |---|---|---|
 | M0 scaffold: repo + license + แผน + remote | — | ✅ เสร็จ |
 | M1 engine.io core: packet + payload codec | #1 | ✅ เสร็จ |
-| M2 session manager + polling transport | #2 | 🔲 รอทำ |
+| M2 session manager + polling transport | #2 | ✅ เสร็จ |
 | M3 websocket transport + upgrade dance | #3 | 🔲 รอทำ |
 | M4 engine.io compliance harness (official suite) | #4 | 🔲 รอทำ |
 | M5 socket.io parser v5 (text + binary attachments) | #5 | 🔲 รอทำ |
@@ -51,7 +51,16 @@ git init, go.mod (`github.com/somprasongd/go-socketio-v4`, go 1.27), MIT LICENSE
 - **เกณฑ์ตรวจ:** golden test byte-exact — handshake JSON, `2probe`/`3probe`,
   encode/decode round-trip ทั้ง text/binary/mixed, edge case ตัวคั่น
 
-### M2 — session manager + polling transport (issue #2)
+### M2 — session manager + polling transport (issue #2) ✅
+
+> เสร็จ: `engineio.Server` (http.Handler, registry, handshake, Close),
+> `engineio.Session` (Send/SendText/SendBinary, heartbeat timer + hbArmed
+> stamp, dispatch goroutine ส่ง OnMessage/OnClose ตามลำดับ), `engineio/polling`
+> (long-poll GET จอดรอ + pollCap ตัดด้วย noop, POST decode + per-packet
+> maxPayload) บทเรียนที่แก้ระหว่างทาง: mutex ไม่ reentrant (ต้องมี sendLocked),
+> ปิด inbound channel ตอน session ตายเพื่อให้ OnClose fire, ลิมิต POST ต้อง
+> เผื่อ slack ให้ per-packet check ทำงานก่อน
+> ตรวจแล้ว: 11 tests + `go test -race` เขียว
 
 - Handshake: GET → OPEN packet `{sid, upgrades, pingInterval, pingTimeout, maxPayload}`
 - Long-poll GET: ค้างรอ packet ใน buffer, ตอบทันทีเมื่อมีข้อมูล, หลาย GET พร้อมกันต้องไม่พัง
