@@ -26,6 +26,8 @@ type Namespace struct {
 	mu      sync.RWMutex
 	adapter Adapter
 
+	recovery *recoveryStore // nil until EnableRecovery
+
 	onConnect    func(*Socket)
 	onDisconnect func(*Socket, string)
 	events       map[string]EventHandler
@@ -51,6 +53,46 @@ func (ns *Namespace) SetAdapter(a Adapter) {
 	ns.mu.Lock()
 	ns.adapter = a
 	ns.mu.Unlock()
+}
+
+// EnableRecovery turns on connection-state recovery for this namespace:
+// after an unexpected disconnection the session — id, rooms, data and the
+// events sent to it — is kept for the window, so a returning client is
+// restored instead of starting over. Enable it before serving.
+func (ns *Namespace) EnableRecovery(opts *RecoveryOptions) {
+	ns.mu.Lock()
+	ns.recovery = newRecoveryStore(opts)
+	ns.mu.Unlock()
+}
+
+func (ns *Namespace) recoveryFields() *recoveryStore {
+	ns.mu.RLock()
+	defer ns.mu.RUnlock()
+	return ns.recovery
+}
+
+func (ns *Namespace) recoveryOpts() *RecoveryOptions {
+	ns.mu.RLock()
+	defer ns.mu.RUnlock()
+	if ns.recovery == nil {
+		return nil
+	}
+	return ns.recovery.opts
+}
+
+func (ns *Namespace) recoveryLookup(pid string) *recoveryEntry {
+	st := ns.recoveryFields()
+	if st == nil {
+		return nil
+	}
+	return st.lookup(pid)
+}
+
+func (ns *Namespace) recoveryDrop(pid string) {
+	st := ns.recoveryFields()
+	if st != nil {
+		st.drop(pid)
+	}
 }
 
 // adapterOf snapshots the current adapter.
@@ -126,7 +168,16 @@ func (ns *Namespace) FetchSockets() []*Socket {
 
 // Emit sends the event to every connected socket of the namespace.
 func (ns *Namespace) Emit(event string, args ...any) {
-	ns.adapterOf().Broadcast(nil, event, args, nil, false)
+	ns.broadcast(nil, event, args, nil, false)
+}
+
+// broadcast delivers through the adapter and, when recovery is on, files
+// the event for held sessions that match the rooms.
+func (ns *Namespace) broadcast(rooms []string, event string, args []any, except map[string]struct{}, volatile bool) {
+	ns.adapterOf().Broadcast(rooms, event, args, except, volatile)
+	if st := ns.recoveryFields(); st != nil {
+		st.broadcastToHeld(rooms, event, args, except, volatile)
+	}
 }
 
 // Volatile returns a namespace-wide target whose emits may be dropped for

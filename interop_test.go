@@ -72,6 +72,17 @@ func TestJSInterop(t *testing.T) {
 	ns.OnEvent("kick-me", func(s *Socket, args []any, ack func(response ...any)) {
 		s.Disconnect()
 	})
+	ns.EnableRecovery(nil)
+	ns.OnEvent("join", func(s *Socket, args []any, ack func(response ...any)) {
+		s.Join("room")
+		s.Emit("seed", "one")
+	})
+	ns.OnEvent("fire", func(s *Socket, args []any, ack func(response ...any)) {
+		ns.To("room").Emit("missed", "during-gap")
+	})
+	ns.OnEvent("check", func(s *Socket, args []any, ack func(response ...any)) {
+		ns.To("room").Emit("room-check", "still-here")
+	})
 	srv.Of("/admin").OnConnect(func(s *Socket) {
 		s.Emit("welcome", "admin here")
 	})

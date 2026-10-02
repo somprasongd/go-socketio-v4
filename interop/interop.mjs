@@ -51,6 +51,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 }
 
 // --- main client: ws-only keeps the rest of the suite tight --------------
+// with server-side recovery on, every event carries a trailing offset
+// argument, which is exactly how the real socket.io client expects it
 const socket = io(URL, { transports: ["websocket"] });
 await once(socket, "connect", "ws-only connect");
 check("connect websocket-only", true);
@@ -63,8 +65,12 @@ check("connect websocket-only", true);
 
 // --- 3. server acked emit (client answers) -------------------------------
 {
-  // the client's answer to the server's acked emit
-  socket.on("provide", (cb) => cb(42));
+  // the client's answer to the server's acked emit; with recovery on, the
+  // last argument is the ack callback, preceded by the event's offset
+  socket.on("provide", (...args) => {
+    const cb = args[args.length - 1];
+    if (typeof cb === "function") cb(42);
+  });
   const answered = once(socket, "provide-result", "server acked emit");
   socket.emit("ask");
   const [value] = await answered;
@@ -144,6 +150,40 @@ check("connect websocket-only", true);
     check("middleware accepts good token", true);
     allowed.disconnect();
   }
+}
+
+// --- 9. connection state recovery ----------------------------------------
+{
+  const rec = io(URL, { transports: ["websocket"] });
+  await once(rec, "connect", "recovery connect");
+  const seeded = once(rec, "seed", "seed event");
+  rec.emit("join");
+  const [seedMsg] = await seeded;
+  check("recovery: seed before disconnect", seedMsg === "one", JSON.stringify(seedMsg));
+
+  // a control socket fires into the room while the main socket is gone
+  const control = io(URL, { transports: ["websocket"] });
+  await once(control, "connect", "control connect");
+  // an unexpected drop: kill the transport without the DISCONNECT packet —
+  // socket.io never recovers a deliberate socket.disconnect()
+  rec.io.engine.close();
+  await sleep(100);
+  control.emit("fire");
+  await sleep(100);
+
+  const reconnected = once(rec, "connect", "recovery reconnect");
+  const missed = once(rec, "missed", "missed replay");
+  rec.connect();
+  await reconnected;
+  check("client reports recovered=true", rec.recovered === true, String(rec.recovered));
+  const [m] = await missed;
+  check("missed event replayed", m === "during-gap", JSON.stringify(m));
+
+  const roomCheck = once(rec, "room-check", "room restored");
+  control.emit("check");
+  const [checkMsg] = await roomCheck;
+  check("rooms restored after recovery", checkMsg === "still-here", JSON.stringify(checkMsg));
+  control.disconnect();
 }
 
 console.log(results.every((r) => r.ok) ? "ALL INTEROP TESTS PASSED" : "INTEROP FAILURES PRESENT");

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/somprasongd/go-socketio-v4/parser"
 )
@@ -158,7 +159,35 @@ func (c *client) routeConnect(name string, pkt parser.Packet) {
 		})
 		return
 	}
+	// Everything from here on runs without c.mu: recovery, middlewares and
+	// their replies all call back into the client.
+	c.mu.Unlock()
+
+	// A returning client identifies itself with the private session id it
+	// was given before the disconnection; a hit inside the window restores
+	// the session instead of starting over.
+	if st := ns.recoveryFields(); st != nil {
+		if pid, _ := auth["pid"].(string); pid != "" {
+			if entry := st.lookup(pid); entry != nil {
+				entry.mu.Lock()
+				disconnected := !entry.discAt.IsZero() && !entry.attached
+				entry.mu.Unlock()
+				if disconnected && c.recoverConnect(ns, entry, auth) {
+					return
+				}
+			}
+		}
+	}
+
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
 	s := &Socket{id: newSocketID(), ns: ns, c: c, handshake: auth}
+	if st := ns.recoveryFields(); st != nil {
+		s.rec = st.start(s.id)
+	}
 	c.mu.Unlock()
 
 	if err := ns.runMiddlewares(s); err != nil {
@@ -179,12 +208,79 @@ func (c *client) routeConnect(name string, pkt parser.Packet) {
 	c.mu.Unlock()
 
 	ns.addSocket(s)
+	reply := map[string]any{"sid": s.id}
+	if s.rec != nil {
+		reply["pid"] = s.rec.pid
+	}
 	c.sendPacket(parser.Packet{
 		Type:      parser.Connect,
 		Namespace: nsName(name),
-		Data:      map[string]any{"sid": s.id},
+		Data:      reply,
 	})
 	ns.fireConnect(s)
+}
+
+// recoverConnect resumes the session held in entry: same id, rooms and
+// data, the connect reply carrying both ids, then the replay of the events
+// the client reported missing. Returns false when recovery cannot proceed,
+// leaving the caller to fall back to a fresh session.
+func (c *client) recoverConnect(ns *Namespace, entry *recoveryEntry, auth map[string]any) bool {
+	opts := ns.recoveryOpts()
+	if opts == nil {
+		return false
+	}
+	s := &Socket{
+		id:        entry.socketID,
+		ns:        ns,
+		c:         c,
+		handshake: auth,
+		rec:       entry,
+		recovered: true,
+	}
+	s.data = entry.data
+
+	if !opts.SkipMiddlewares {
+		if err := ns.runMiddlewares(s); err != nil {
+			c.sendPacket(parser.Packet{
+				Type:      parser.ConnectError,
+				Namespace: nsName(ns.name),
+				Data:      map[string]any{"message": err.Error()},
+			})
+			return false
+		}
+	}
+
+	entry.mu.Lock()
+	entry.discAt = time.Time{}
+	entry.attached = true
+	entry.mu.Unlock()
+
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return false
+	}
+	c.conns[ns.name] = s
+	c.mu.Unlock()
+
+	ns.addSocket(s)
+	for _, room := range entry.rooms {
+		ns.adapterOf().Add(s, room)
+	}
+	var offset string
+	if v, ok := auth["offset"].(string); ok {
+		offset = v
+	}
+	c.sendPacket(parser.Packet{
+		Type:      parser.Connect,
+		Namespace: nsName(ns.name),
+		Data:      map[string]any{"sid": s.id, "pid": entry.pid},
+	})
+	ns.fireConnect(s)
+	for _, ev := range entry.replayAfter(offset) {
+		_ = c.sendEncoded(ev.text, ev.bins)
+	}
+	return true
 }
 
 func (c *client) routeDisconnect(name string) {
@@ -198,6 +294,7 @@ func (c *client) routeDisconnect(name string) {
 	c.mu.Unlock()
 
 	s.ns.removeSocket(s)
+	s.finalizeEntry(reasonClientDisconnect)
 	s.ns.fireDisconnect(s, reasonClientDisconnect)
 }
 
@@ -246,6 +343,8 @@ func (c *client) kill(reason string) {
 	}
 	c.conns = map[string]*Socket{}
 	for _, s := range conns {
+		// snapshot the rooms while the adapter still knows them
+		s.finalizeEntry(reason)
 		s.ns.removeSocket(s)
 	}
 	c.ackMu.Lock()
@@ -273,6 +372,17 @@ func (c *client) sendPacket(pkt parser.Packet) error {
 		log.Printf("socketio: cannot encode packet for %s: %v", c.sess.ID(), err)
 		return err
 	}
+	return c.sendEncodedLocked(text, bins)
+}
+
+// sendEncoded transmits an already-encoded packet under the wire lock.
+func (c *client) sendEncoded(text string, bins [][]byte) error {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	return c.sendEncodedLocked(text, bins)
+}
+
+func (c *client) sendEncodedLocked(text string, bins [][]byte) error {
 	if err := c.sess.SendText(text); err != nil {
 		return err
 	}

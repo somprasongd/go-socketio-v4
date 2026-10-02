@@ -209,8 +209,8 @@ git init, go.mod (`github.com/somprasongd/go-socketio-v4`, go 1.27), MIT LICENSE
 |---|---|---|
 | M10 middleware + auth payload + origin allow-list | #10 | ✅ เสร็จ — interop 13/13 |
 | M11 volatile events | #11 | 🔲 รอทำ |
-| M12 adapter interface + Redis adapter | #12 | 🔲 รอทำ |
-| M13 connection-state recovery | #13 | 🔲 รอทำ |
+| M12 adapter interface + Redis adapter | #12 | ✅ เสร็จ — miniredis 4 tests |
+| M13 connection-state recovery | #13 | ✅ เสร็จ — interop 17/17 |
 
 ### M11 — volatile events (#11) ✅
 
@@ -233,3 +233,18 @@ git init, go.mod (`github.com/somprasongd/go-socketio-v4`, go 1.27), MIT LICENSE
 > (cross-process broadcast, room scoping, binary relay, namespace isolation)
 > บทเรียน: gorilla ห้าม read ซ้ำหลัง read error → negative assertion
 > ต้องใช้ reader goroutine; CONNECT ข้าม namespace ต้องมี comma ปิดท้าย
+
+### M13 — connection-state recovery (#13) ✅ interop 17/17
+
+> `Namespace.EnableRecovery(*RecoveryOptions)` (MaxDisconnectionDuration
+> default 2m, SkipMiddlewares, MaxSessions, MaxBufferedEvents) — wire
+> ตรงกับ socket.io ≥ 4.6: CONNECT reply แนบ `pid`, ทุก EVENT ที่ส่งให้
+> socket ถูกประทับ offset ต่อท้าย args, client กลับมาด้วย
+> `0{"pid","offset"}` ในหน้าต่างเวลา → ได้ id/rooms/data เดิม + replay
+> event ที่พลาด (รวม event ที่ยิงระหว่างหลุดผ่าน broadcastToHeld);
+> disconnect แบบตั้งใจ (client DISCONNECT / server kick) ไม่ recover
+> ตาม spec
+> บทเรียน: kill() ต้อง snapshot rooms ก่อน removeSocket (adapter ลบ
+> membership ก่อนไม่ได้); client JS ไม่ strip offset — handler ต้องรับ
+> arg ท้ายเอง ตามที่แอป socket.io จริงต้องเขียน; `socket.disconnect()`
+> ฝั่ง client ไม่มีทาง recover เพราะเป็น intentional
