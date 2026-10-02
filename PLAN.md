@@ -22,7 +22,7 @@ Socket.IO v4 + Engine.IO v4 server implementation สำหรับ Go — **�
 | M1 engine.io core: packet + payload codec | #1 | ✅ เสร็จ |
 | M2 session manager + polling transport | #2 | ✅ เสร็จ |
 | M3 websocket transport + upgrade dance | #3 | ✅ เสร็จ |
-| M4 engine.io compliance harness (official suite) | #4 | 🔲 รอทำ |
+| M4 engine.io compliance harness (official suite) | #4 | ✅ เสร็จ — 24/24 ผ่าน |
 | M5 socket.io parser v5 (text + binary attachments) | #5 | 🔲 รอทำ |
 | M6 socket.io server core: nsp/rooms/ack/broadcast | #6 | 🔲 รอทำ |
 | M7 public API + http.Handler wiring + e2e | #7 | 🔲 รอทำ |
@@ -85,7 +85,22 @@ git init, go.mod (`github.com/somprasongd/go-socketio-v4`, go 1.27), MIT LICENSE
 - รองรับ ws-first (เชื่อมมาที่ transport=websocket โดยไม่มี sid ก็ได้)
 - **เกณฑ์ตรวจ:** test ด้วย gorilla client จริง — upgrade สำเร็จ, echo หลังสลับช่อง, heartbeat บน ws
 
-### M4 — engine.io compliance harness (issue #4)
+### M4 — engine.io compliance harness (issue #4) ✅ 24/24 ผ่าน
+
+> เสร็จ: `compliance/` เก็บ official suite แบบ verbatim (engine.io-protocol
+> commit f21de7b, MIT) + `compliance/run.sh` + `cmd/compliance-server`
+> (echo server ตาม reference config ของ suite)
+> การแข่งกับ suite ทำให้ต้องแก้ protocol จริง 3 เรื่อง:
+> 1. **ทิศ heartbeat กลับข้าง** — engine.io 6.4+ เป็น server ส่ง ping "2"
+>    client ตอบ pong "3" (ไม่ใช่ client ping ตามที่ implement แรก); client
+>    ping = protocol violation
+> 2. **probe สำเร็จ = flush ช่องเก่าทันที** — หลังตอบ "3probe" ช่อง polling
+>    ต้องจบด้วย noop แม้ client ยังไม่ส่ง "5"
+> 3. **close semantics** — client สั่งปิดเอง: parked/late poll ได้ noop "6";
+>    ปิดโดย server (timeout/protocol/shutdown): ได้ close "1"; duplicate
+>    poll ปิด session ทิ้งตาม spec; poll หลัง upgrade = 400 โดย session
+>    ยังอยู่
+> ตรวจแล้ว: `compliance/run.sh` → 24 passing + `go test -race` เขียว
 
 - `cmd/compliance-server`: echo server ผูกกับ library ของเรา ตั้งค่าตามที่ suite กำหนด
   (pingInterval:300, pingTimeout:200, maxPayload:1e6)

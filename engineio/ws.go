@@ -60,6 +60,16 @@ func (srv *Server) serveWebSocketRequest(w http.ResponseWriter, r *http.Request,
 		_ = t.close()
 		return
 	}
+	s.mu.Lock()
+	busy := s.ws != nil
+	s.mu.Unlock()
+	if busy {
+		// One WebSocket owns the session; a second connection with the same
+		// sid is dropped (the spec's "ignores WebSocket connection with
+		// same sid after upgrade").
+		_ = t.close()
+		return
+	}
 	go s.wsReadLoop(t, true)
 }
 
@@ -74,7 +84,7 @@ func (srv *Server) serveWebSocketOnly(t *wsTransport) {
 	s.mu.Lock()
 	s.ws = t
 	s.transport = "websocket"
-	body, err := srv.handshakeBody(s, nil)
+	body, err := srv.handshakeBody(s, []string{})
 	if err != nil {
 		s.closeLocked(CloseServer)
 		s.mu.Unlock()
@@ -145,12 +155,26 @@ func (s *Session) wsReadLoop(t *wsTransport, probing bool) {
 		switch {
 		case p.Type == packet.Ping:
 			s.mu.Unlock()
-			// Answered on this socket directly: before the switch the
-			// session does not route anything through it.
+			// Only valid as the upgrade probe on this socket: before the
+			// switch the session does not route anything through it. (A
+			// post-upgrade client ping hits the default branch — the server
+			// is the pinger in protocol v4.)
 			if err := t.writePacket(packet.Packet{Type: packet.Pong, Data: p.Data}); err != nil {
 				_ = t.close()
 				return
 			}
+			// A answered probe ends the polling channel: the spec flushes
+			// it with a noop right here, before the client even sends the
+			// upgrade packet, so the next poll retires instead of parking.
+			s.mu.Lock()
+			if s.ws == nil {
+				s.flushed = true
+				select {
+				case s.wake <- struct{}{}:
+				default:
+				}
+			}
+			s.mu.Unlock()
 		case p.Type == packet.Close:
 			s.closeLocked(CloseTransport)
 			s.mu.Unlock()
@@ -158,7 +182,17 @@ func (s *Session) wsReadLoop(t *wsTransport, probing bool) {
 			return
 		case p.Type == packet.Upgrade && !upgraded:
 			upgraded = true
-			s.switchToWebSocketLocked(t)
+			if s.ws == nil {
+				s.switchToWebSocketLocked(t)
+				s.mu.Unlock()
+			} else {
+				// Another transport won the session while this one probed.
+				s.mu.Unlock()
+				_ = t.close()
+				return
+			}
+		case p.Type == packet.Pong && upgraded:
+			// The answer to the server's ping; refresh above is enough.
 			s.mu.Unlock()
 		case p.Type == packet.Message && upgraded:
 			// Queueing never blocks, so the reader never sits on the mutex

@@ -135,9 +135,12 @@ func TestUpgradeFromPolling(t *testing.T) {
 		t.Errorf("post-upgrade echo = %q", text)
 	}
 
-	writeText(t, c, "2")
-	if _, text, _ := readFrame(t, c); text != "3" {
-		t.Errorf("post-upgrade ping answered %q", text)
+	// A client pong is accepted after the upgrade (it answers the server's
+	// ping), and the session keeps working afterwards.
+	writeText(t, c, "3")
+	writeText(t, c, "4after-pong")
+	if _, text, _ := readFrame(t, c); text != "4after-pong" {
+		t.Errorf("echo after pong = %q", text)
 	}
 
 	// polling after the switch is a protocol violation and closes the session

@@ -47,7 +47,8 @@ type Session struct {
 	transport string // "polling" or "websocket"; a wsConn implies "websocket"
 	ws        wsConn // non-nil once the WebSocket transport took over
 	hbTimer   *time.Timer
-	hbArmed   time.Time // when the live timer was scheduled
+	hbArmed   time.Time // when the live ping timer was scheduled
+	pingSent  time.Time // when the current outstanding Ping left
 	lastRecv  time.Time
 
 	inQ    []inbound // received Message packets waiting for the app
@@ -155,15 +156,22 @@ func (s *Session) closeLocked(reason CloseReason) {
 		s.hbTimer.Stop()
 	}
 	s.srv.removeSession(s)
-	// Tell the client before tearing down so a parked poll carries the
-	// close packet instead of dying with the connection.
-	s.buf = append(s.buf, packet.Packet{Type: packet.Close})
-	if s.ws != nil {
-		_ = s.ws.close()
+	// Tell the client before tearing down. A client-initiated close needs
+	// no close packet — it knows — so its parked poll retires with a noop
+	// instead; every other reason delivers the close packet.
+	bye := packet.Packet{Type: packet.Close}
+	if reason == CloseTransport {
+		bye = packet.Packet{Type: packet.Noop}
 	}
-	select {
-	case s.wake <- struct{}{}:
-	default:
+	if s.ws != nil {
+		_ = s.ws.writePacket(bye)
+		_ = s.ws.close()
+	} else {
+		s.buf = append(s.buf, bye)
+		select {
+		case s.wake <- struct{}{}:
+		default:
+		}
 	}
 	close(s.done)
 	// Waking the dispatcher is what retires it, and it is where OnClose
@@ -182,7 +190,11 @@ func (s *Session) handleIncomingLocked(p packet.Packet) {
 	s.armHeartbeatLocked()
 	switch p.Type {
 	case packet.Ping:
-		_ = s.sendLocked(packet.Packet{Type: packet.Pong, Data: p.Data})
+		// The server is the pinger in protocol v4; a client ping is stale
+		// v3 behaviour and means the peer is not who we think it is.
+		s.closeLocked(CloseProtocol)
+	case packet.Pong:
+		// The answer to our ping; the refresh above is all it needs.
 	case packet.Message:
 		// Queueing never blocks (see dispatch), so packet handlers never
 		// sit on the mutex waiting for the application to keep up.
@@ -194,36 +206,53 @@ func (s *Session) handleIncomingLocked(p packet.Packet) {
 		// Upgrade belongs on the new transport; a stray one on the old
 		// transport is harmless. Noop never travels client→server, but
 		// ignoring beats killing sessions over it.
-	case packet.Open, packet.Pong:
-		// Only the server sends these; a client speaking them is broken.
+	case packet.Open:
+		// Only the server sends this.
 		s.closeLocked(CloseProtocol)
 	}
 }
 
-func (s *Session) deadline() time.Duration {
-	return s.srv.opts.PingInterval + s.srv.opts.PingTimeout
-}
-
-// armHeartbeatLocked schedules the expiry check. Every received packet
-// re-arms, so the live timer always measures from the last traffic; the
-// hbArmed stamp tells a late-fired stale timer to stand down.
+// armHeartbeatLocked schedules the next server ping. The engine.io 6.4+
+// revision of protocol v4 has the server sending the Ping and the client
+// answering Pong — the reverse of v3 — so the timer is the pinger, and the
+// deadline only ever fires against real traffic timestamps.
 func (s *Session) armHeartbeatLocked() {
 	s.hbArmed = time.Now()
 	if s.hbTimer != nil {
 		s.hbTimer.Stop()
 	}
-	s.hbTimer = time.AfterFunc(s.deadline(), s.checkHeartbeat)
+	s.hbTimer = time.AfterFunc(s.srv.opts.PingInterval, s.onPingDue)
 }
 
-func (s *Session) checkHeartbeat() {
+// onPingDue sends the Ping and starts the Pong deadline. A stale timer whose
+// session saw traffic in the meantime stands down: that traffic re-armed a
+// fresher one.
+func (s *Session) onPingDue() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.lastRecv.After(s.hbArmed) {
+		return
+	}
+	if err := s.sendLocked(packet.Packet{Type: packet.Ping}); err != nil {
+		return
+	}
+	s.pingSent = time.Now()
+	if s.hbTimer != nil {
+		s.hbTimer.Stop()
+	}
+	s.hbTimer = time.AfterFunc(s.srv.opts.PingTimeout, s.onPongDeadline)
+}
+
+// onPongDeadline closes the session unless traffic arrived after the last
+// ping went out.
+func (s *Session) onPongDeadline() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return
 	}
-	if s.lastRecv.After(s.hbArmed) {
-		// Traffic arrived after this timer was scheduled; the re-arm that
-		// traffic triggered owns the deadline now.
+	if s.lastRecv.After(s.pingSent) {
+		s.armHeartbeatLocked()
 		return
 	}
 	s.closeLocked(CloseTimeout)

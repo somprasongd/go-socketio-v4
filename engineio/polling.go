@@ -30,17 +30,27 @@ func (s *Session) servePollingGet(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	switch {
 	case s.closed:
+		// The close landed while this request was in flight. Deliver the
+		// same goodbye the parked poll would have carried: the client that
+		// closed the session itself already knows, so it gets a noop.
+		reason := s.reason
 		s.mu.Unlock()
-		writePollPayload(w, []packet.Packet{{Type: packet.Close}})
+		if reason == CloseTransport {
+			writePollPayload(w, []packet.Packet{{Type: packet.Noop}})
+		} else {
+			writePollPayload(w, []packet.Packet{{Type: packet.Close}})
+		}
 		return
 	case s.ws != nil:
-		// The session upgraded to WebSocket; a fresh poll would split the
-		// stream in two, so this is a protocol violation, not a downgrade.
-		s.closeLocked(CloseProtocol)
+		// The session lives on WebSocket now. Stale polls are refused but
+		// the session is left alone — the socket keeps working.
 		s.mu.Unlock()
 		http.Error(w, "session upgraded", http.StatusBadRequest)
 		return
 	case s.polling:
+		// Two open polls for one session cannot both stream; the spec
+		// closes the session and lets the parked poll go out with "1".
+		s.closeLocked(CloseProtocol)
 		s.mu.Unlock()
 		http.Error(w, "overlapping polling request", http.StatusBadRequest)
 		return

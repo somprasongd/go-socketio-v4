@@ -188,24 +188,48 @@ func TestEchoOverPolling(t *testing.T) {
 	}
 }
 
-func TestPingPongOverPolling(t *testing.T) {
-	h := newHarness(t, nil)
+func TestServerPingClientPong(t *testing.T) {
+	h := newHarness(t, &Options{PingInterval: 60 * time.Millisecond, PingTimeout: 60 * time.Millisecond})
 	sid := h.handshake().SID
 
 	got := make(chan string, 1)
 	go func() {
 		got <- h.pollOnce(sid)
 	}()
-	if resp := h.post(sid, "2probe"); resp.StatusCode != http.StatusOK {
+	// The server pings ~60ms after the handshake; the parked poll carries it.
+	select {
+	case body := <-got:
+		if body != "2" {
+			t.Fatalf("poll body = %q, want server ping 2", body)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server ping never arrived on the poll")
+	}
+
+	// The client's pong must be accepted and keep the session alive long
+	// enough for the next ping to come out.
+	if resp := h.post(sid, "3"); resp.StatusCode != http.StatusOK {
+		t.Fatalf("pong POST status = %d", resp.StatusCode)
+	}
+	if body := h.pollOnce(sid); body != "2" {
+		t.Errorf("next poll body = %q, want the following ping 2", body)
+	}
+}
+
+func TestClientPingIsProtocolViolation(t *testing.T) {
+	h := newHarness(t, nil)
+	sid := h.handshake().SID
+
+	if resp := h.post(sid, "2"); resp.StatusCode != http.StatusOK {
 		t.Fatalf("POST status = %d", resp.StatusCode)
 	}
 	select {
-	case body := <-got:
-		if body != "3probe" {
-			t.Errorf("ping answered %q, want %q", body, "3probe")
+	case reason := <-h.closed:
+		if reason != CloseProtocol {
+			t.Errorf("close reason = %q, want %q", reason, CloseProtocol)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("parked poll never returned with pong")
+		t.Fatal("client ping did not close the session")
 	}
 }
 
@@ -265,22 +289,13 @@ func TestServerCloseFlushesParkedPoll(t *testing.T) {
 	}
 }
 
-func TestOverlappingPollsRejected(t *testing.T) {
+func TestOverlappingPollClosesSession(t *testing.T) {
 	h := newHarness(t, nil)
 	sid := h.handshake().SID
 
 	first := make(chan string, 1)
-	firstStatus := make(chan int, 1)
 	go func() {
-		resp, err := h.get(sid)
-		if err != nil {
-			firstStatus <- -1
-			return
-		}
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		firstStatus <- resp.StatusCode
-		first <- string(body)
+		first <- h.pollOnce(sid)
 	}()
 
 	time.Sleep(50 * time.Millisecond) // let the first poll park
@@ -294,17 +309,58 @@ func TestOverlappingPollsRejected(t *testing.T) {
 		t.Errorf("overlapping GET status = %d, want 400", resp.StatusCode)
 	}
 
-	// The first poll stays parked and usable.
-	if resp := h.post(sid, "4still-alive"); resp.StatusCode != http.StatusOK {
-		t.Fatalf("POST after overlap status = %d", resp.StatusCode)
-	}
+	// The parked poll goes out with the close packet, per the spec: two open
+	// polls cannot both stream, so the session ends.
 	select {
 	case body := <-first:
-		if body != "4still-alive" {
-			t.Errorf("first poll body = %q", body)
+		if body != "1" {
+			t.Errorf("parked poll after duplicate = %q, want close 1", body)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("first poll never returned")
+		t.Fatal("parked poll never returned after duplicate")
+	}
+
+	resp, err = h.get(sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("GET after duplicate close status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestClientCloseFlushesParkedPollWithNoop(t *testing.T) {
+	h := newHarness(t, nil)
+	sid := h.handshake().SID
+
+	got := make(chan string, 1)
+	go func() {
+		got <- h.pollOnce(sid)
+	}()
+	time.Sleep(50 * time.Millisecond) // let the poll park
+
+	if resp := h.post(sid, "1"); resp.StatusCode != http.StatusOK {
+		t.Fatalf("close POST status = %d", resp.StatusCode)
+	}
+
+	// The client asked to close, so it already knows: the parked poll
+	// retires with a noop, not another close packet (spec behaviour).
+	select {
+	case body := <-got:
+		if body != "6" {
+			t.Errorf("parked poll after client close = %q, want noop 6", body)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("parked poll never returned after client close")
+	}
+	select {
+	case reason := <-h.closed:
+		if reason != CloseTransport {
+			t.Errorf("close reason = %q, want %q", reason, CloseTransport)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnClose not called after client close")
 	}
 }
 
@@ -356,22 +412,18 @@ func TestHeartbeatTimeoutClosesSession(t *testing.T) {
 }
 
 func TestHeartbeatKeptAliveByTraffic(t *testing.T) {
-	deadline := 80 * time.Millisecond // PingInterval+PingTimeout below
 	h := newHarness(t, &Options{PingInterval: 40 * time.Millisecond, PingTimeout: 40 * time.Millisecond})
 	sid := h.handshake().SID
 
-	// Ping, then ping again just before the first window closes: the second
-	// ping must extend the deadline past the original one. If refresh were
-	// broken the session would die at ~80ms; the run below reaches ~100ms,
-	// still short of the refreshed 130ms deadline.
-	if resp := h.post(sid, "2"); resp.StatusCode != http.StatusOK {
-		t.Fatalf("ping status = %d", resp.StatusCode)
+	// The server pings ~40ms in and starts a 40ms pong deadline. A pong at
+	// ~55ms must extend the session past the original 80ms deadline; if the
+	// refresh were broken the session would die at ~80ms and this run, which
+	// reaches ~105ms, would see it.
+	time.Sleep(55 * time.Millisecond)
+	if resp := h.post(sid, "3"); resp.StatusCode != http.StatusOK {
+		t.Fatalf("pong POST status = %d", resp.StatusCode)
 	}
-	time.Sleep(deadline / 2) // ~40ms
-	if resp := h.post(sid, "2"); resp.StatusCode != http.StatusOK {
-		t.Fatalf("refresh ping status = %d", resp.StatusCode)
-	}
-	time.Sleep(deadline/2 + 20*time.Millisecond) // ~100ms since start
+	time.Sleep(50 * time.Millisecond)
 
 	select {
 	case reason := <-h.closed:
