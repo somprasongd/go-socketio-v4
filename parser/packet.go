@@ -105,12 +105,15 @@ func (t Type) base() Type {
 	return t
 }
 
-// argsOf returns the packet's payload as an argument list, for the event
+// Args returns the packet's payload as an argument list, for the event
 // family. Packets without a list yield nil.
-func (p Packet) argsOf() []any {
+func (p Packet) Args() []any {
 	args, _ := p.Data.([]any)
 	return args
 }
+
+// argsOf is the package-internal alias of Args.
+func (p Packet) argsOf() []any { return p.Args() }
 
 // errf is a small helper keeping decode errors uniform.
 func errf(format string, a ...any) error {

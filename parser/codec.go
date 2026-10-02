@@ -6,6 +6,24 @@ import (
 	"strings"
 )
 
+// NeededAttachments reports how many binary attachments a text packet
+// expects, or -1 when the type carries none. Callers use it to know whether
+// the binary Engine.IO packets that follow are part of this packet.
+func NeededAttachments(text string) int {
+	if len(text) == 0 || text[0] != '5' && text[0] != '6' {
+		return -1
+	}
+	dash := strings.IndexByte(text[1:], '-')
+	if dash < 0 {
+		return 0 // Decode reports the malformed count
+	}
+	n, err := strconv.Atoi(text[1 : 1+dash])
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
 // Decode parses one Socket.IO text packet and splices the attachments that
 // followed it (binary Engine.IO packets) into the payload. attachments must
 // be nil for the plain-text types.
@@ -19,11 +37,9 @@ func Decode(text string, attachments [][]byte) (Packet, error) {
 	t := Type(text[0] - '0')
 	rest := text[1:]
 
-	// Binary types lead with the attachment count and a dash.
+	// Binary types lead with the attachment count and a dash. Zero declared
+	// attachments with none given stays legal (`50-[]`).
 	if t == BinaryEvent || t == BinaryAck {
-		if len(attachments) == 0 {
-			return Packet{}, errf("%s requires attachments", t)
-		}
 		dash := strings.IndexByte(rest, '-')
 		if dash < 0 {
 			return Packet{}, errf("%s is missing the attachment count", t)

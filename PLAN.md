@@ -24,7 +24,7 @@ Socket.IO v4 + Engine.IO v4 server implementation สำหรับ Go — **�
 | M3 websocket transport + upgrade dance | #3 | ✅ เสร็จ |
 | M4 engine.io compliance harness (official suite) | #4 | ✅ เสร็จ — 24/24 ผ่าน |
 | M5 socket.io parser v5 (text + binary attachments) | #5 | ✅ เสร็จ |
-| M6 socket.io server core: nsp/rooms/ack/broadcast | #6 | 🔲 รอทำ |
+| M6 socket.io server core: nsp/rooms/ack/broadcast | #6 | ✅ เสร็จ |
 | M7 public API + http.Handler wiring + e2e | #7 | 🔲 รอทำ |
 | M8 JS interop tests (socket.io-client v4 จริง) | #8 | 🔲 รอทำ |
 | M9 docs + example + สรุปสถานะ | #9 | 🔲 รอทำ |
@@ -124,7 +124,18 @@ git init, go.mod (`github.com/somprasongd/go-socketio-v4`, go 1.27), MIT LICENSE
   packet แยก; ฝั่งส่งต้อง replace และแยก attachments ให้ถูก
 - **เกณฑ์ตรวจ:** table-driven test ใช้ตัวอย่างจาก spec ตรงตัว ทั้ง text และ binary
 
-### M6 — socket.io server core (issue #6)
+### M6 — socket.io server core (issue #6) ✅
+
+> เสร็จ: root package `socketio` — Server/Of/DefaultNamespace, client
+> (state machine รวม attachment buffering สำหรับ BINARY_EVENT, ack
+> bookkeeping), Namespace (handlers + rooms + adapter ในตัว), Socket
+> (Emit/EmitWithAck/Join/Leave/Rooms/Broadcast/To/Disconnect), แผนที่
+> disconnect reason เป็นคำศัพท์ของ socket.io ("io client disconnect",
+> "transport close", "ping timeout", "parse error", ...)
+> การออกแบบสำคัญ: 2 locks — mu คุมลำดับ packet ขาเข้า, sendMu คุม
+> ลำดับบนสาย (text+attachments ต้องติดกัน); handler รันใต้ mu และส่ง
+> ผ่าน sendMu จึงไม่ deadlock เวลา handler echo กลับ
+> ตรวจแล้ว: 12 tests ผ่าน fake connection + `go test -race` เขียว
 
 - Namespace: `/` + นอกจากนี้, connect handshake พร้อม auth payload, CONNECT_ERROR
 - Event dispatch, ack round-trip (ตอบ ACK งานที่ client ส่ง id มา + server emit แบบขอ ack)
