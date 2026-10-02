@@ -19,7 +19,7 @@ Socket.IO v4 + Engine.IO v4 server implementation สำหรับ Go — **�
 | Milestone | Issue | สถานะ |
 |---|---|---|
 | M0 scaffold: repo + license + แผน + remote | — | ✅ เสร็จ |
-| M1 engine.io core: packet + payload codec | #1 | 🔲 รอทำ |
+| M1 engine.io core: packet + payload codec | #1 | ✅ เสร็จ |
 | M2 session manager + polling transport | #2 | 🔲 รอทำ |
 | M3 websocket transport + upgrade dance | #3 | 🔲 รอทำ |
 | M4 engine.io compliance harness (official suite) | #4 | 🔲 รอทำ |
@@ -36,7 +36,12 @@ Socket.IO v4 + Engine.IO v4 server implementation สำหรับ Go — **�
 git init, go.mod (`github.com/somprasongd/go-socketio-v4`, go 1.27), MIT LICENSE,
 .gitignore, Makefile, PLAN.md นี้, สร้าง remote repo ผ่าน `gh repo create` แล้ว push
 
-### M1 — engine.io core: packet + payload codec (issue #1)
+### M1 — engine.io core: packet + payload codec (issue #1) ✅
+
+> เสร็จ: `engineio/packet` (Type 0–6, Packet, EncodePacket/DecodePacket,
+> EncodePayload/DecodePayload รองรับ text/binary/mixed + Separator `0x1e`),
+> `engineio.Options` + defaults, Handshake JSON byte-pinned
+> ตรวจแล้ว: `go vet` + golden tests ทั้งหมดเขียว (`go test ./engineio/packet`)
 
 - `engineio/packet`: type 0-6 (open, close, ping, pong, message, upgrade, noop),
   packet = `<type><data>`, message packet มีได้ทั้ง string และ binary
