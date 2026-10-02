@@ -41,10 +41,15 @@ func (t *wsTransport) close() error {
 // WebSocket-only session (empty sid) or attaches to an existing one as the
 // probing transport (the upgrade dance).
 func (srv *Server) serveWebSocketRequest(w http.ResponseWriter, r *http.Request, sid string) {
-	// engine.io's default is to allow any origin; origin policy is the
-	// embedding application's call, and gorilla's default (same-origin
-	// only) would silently break every cross-origin client.
-	up := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	// The origin list is the server's policy (loopback deployments want
+	// engine.io's allow-all default); gorilla's same-origin-only default
+	// would silently break every cross-origin client.
+	up := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			origin := r.Header.Get("Origin")
+			return origin == "" || srv.opts.allowsOrigin(origin)
+		},
+	}
 	conn, err := up.Upgrade(w, r, nil)
 	if err != nil {
 		return // Upgrade already wrote the HTTP error

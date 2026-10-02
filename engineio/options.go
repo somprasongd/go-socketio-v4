@@ -28,6 +28,24 @@ type Options struct {
 	// MaxPayload is the largest single packet accepted or sent, in bytes,
 	// matching engine.io's per-packet limit.
 	MaxPayload int
+	// AllowedOrigins lists the Origin header values allowed to open a
+	// connection. Empty, or a single "*", allows every origin — the
+	// engine.io default, right for loopback-only deployments. Anything
+	// else is refused with 403 on both polling and WebSocket.
+	AllowedOrigins []string
+}
+
+// allowsOrigin reports whether the given Origin header value may connect.
+func (o *Options) allowsOrigin(origin string) bool {
+	if len(o.AllowedOrigins) == 0 {
+		return true
+	}
+	for _, allowed := range o.AllowedOrigins {
+		if allowed == "*" || allowed == origin {
+			return true
+		}
+	}
+	return false
 }
 
 func (o *Options) withDefaults() *Options {

@@ -202,3 +202,12 @@ git init, go.mod (`github.com/somprasongd/go-socketio-v4`, go 1.27), MIT LICENSE
 - `cmd/example`: echo server สาธิต API
 - สรุปสถานะจริงทั้งหมดลง PLAN.md, tag v0.1.0
 - **เกณฑ์ตรวจ:** `go build ./... && go test ./... && go vet ./... && gofmt -l .` เขียวทั้งหมด
+
+## v0.2 milestones
+
+| Milestone | Issue | สถานะ |
+|---|---|---|
+| M10 middleware + auth payload + origin allow-list | #10 | ✅ เสร็จ — interop 13/13 |
+| M11 volatile events | #11 | 🔲 รอทำ |
+| M12 adapter interface + Redis adapter | #12 | 🔲 รอทำ |
+| M13 connection-state recovery | #13 | 🔲 รอทำ |

@@ -9,9 +9,10 @@ import (
 
 // Socket is one client connection to one namespace.
 type Socket struct {
-	id string
-	ns *Namespace
-	c  *client
+	id        string
+	ns        *Namespace
+	c         *client
+	handshake map[string]any
 
 	mu   sync.Mutex
 	data any
@@ -20,6 +21,11 @@ type Socket struct {
 // ID is the namespace-connection id, as also sent to the client in the
 // connect handshake.
 func (s *Socket) ID() string { return s.id }
+
+// Handshake returns the auth payload the client sent with its CONNECT
+// packet — socket.io's `socket.handshake.auth`. Nil when the client sent
+// no auth. Read it from connection middleware to enforce credentials.
+func (s *Socket) Handshake() map[string]any { return s.handshake }
 
 // Namespace is the namespace the socket belongs to.
 func (s *Socket) Namespace() *Namespace { return s.ns }

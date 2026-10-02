@@ -114,7 +114,7 @@ func (c *client) route(pkt parser.Packet) {
 
 	switch pkt.Type {
 	case parser.Connect:
-		c.routeConnect(name)
+		c.routeConnect(name, pkt)
 	case parser.Disconnect:
 		c.routeDisconnect(name)
 	case parser.Event, parser.BinaryEvent:
@@ -133,9 +133,13 @@ func (c *client) route(pkt parser.Packet) {
 	}
 }
 
-// routeConnect opens a namespace connection. Unknown namespaces are refused
-// with CONNECT_ERROR, as the spec requires.
-func (c *client) routeConnect(name string) {
+// routeConnect opens a namespace connection. Middlewares inspect the socket
+// first (auth and friends); an error becomes a CONNECT_ERROR and the
+// namespace never accepts the socket. Unknown namespaces are refused with
+// CONNECT_ERROR too, as the spec requires.
+func (c *client) routeConnect(name string, pkt parser.Packet) {
+	auth, _ := pkt.Data.(map[string]any)
+
 	c.mu.Lock()
 	if c.closed || c.conns[name] != nil {
 		// already connected; ignore the repeat
@@ -154,7 +158,23 @@ func (c *client) routeConnect(name string) {
 		})
 		return
 	}
-	s := &Socket{id: newSocketID(), ns: ns, c: c}
+	s := &Socket{id: newSocketID(), ns: ns, c: c, handshake: auth}
+	c.mu.Unlock()
+
+	if err := ns.runMiddlewares(s); err != nil {
+		c.sendPacket(parser.Packet{
+			Type:      parser.ConnectError,
+			Namespace: nsName(name),
+			Data:      map[string]any{"message": err.Error()},
+		})
+		return
+	}
+
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
 	c.conns[name] = s
 	c.mu.Unlock()
 

@@ -10,6 +10,13 @@ import (
 // client, in packet order, and may call back into the socket freely.
 type EventHandler func(s *Socket, args []any, ack func(response ...any))
 
+// MiddlewareFunc inspects a socket while its CONNECT packet is being
+// processed, before the namespace accepts it. Returning a non-nil error
+// refuses the connection: the client receives a CONNECT_ERROR carrying the
+// error's message, OnConnect never fires, and the socket is never
+// registered. Typical use is checking Socket.Handshake() for credentials.
+type MiddlewareFunc func(s *Socket) error
+
 // Namespace is a socket.io namespace: an independent connection space with
 // its own sockets, rooms and handlers. Get them from Server.Of.
 type Namespace struct {
@@ -23,6 +30,7 @@ type Namespace struct {
 	onConnect    func(*Socket)
 	onDisconnect func(*Socket, string)
 	events       map[string]EventHandler
+	middlewares  []MiddlewareFunc
 }
 
 func newNamespace(srv *Server, name string) *Namespace {
@@ -37,6 +45,28 @@ func newNamespace(srv *Server, name string) *Namespace {
 
 // Name is the namespace's identifier: "/" for the default one.
 func (ns *Namespace) Name() string { return ns.name }
+
+// Use registers a connection middleware. Middlewares run in registration
+// order for every incoming CONNECT, before the connection is accepted;
+// register them before serving.
+func (ns *Namespace) Use(fn MiddlewareFunc) {
+	ns.mu.Lock()
+	ns.middlewares = append(ns.middlewares, fn)
+	ns.mu.Unlock()
+}
+
+// runMiddlewares executes the chain; the first error refuses the socket.
+func (ns *Namespace) runMiddlewares(s *Socket) error {
+	ns.mu.RLock()
+	fns := ns.middlewares
+	ns.mu.RUnlock()
+	for _, fn := range fns {
+		if err := fn(s); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 // OnConnect registers a connection handler.
 func (ns *Namespace) OnConnect(fn func(*Socket)) {

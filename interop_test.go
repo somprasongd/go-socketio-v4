@@ -2,6 +2,7 @@ package socketio
 
 import (
 	"context"
+	"errors"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -75,6 +76,19 @@ func TestJSInterop(t *testing.T) {
 		s.Emit("welcome", "admin here")
 	})
 
+	// A second server enforces credentials through connection middleware —
+	// the auth path must be observable from the real client.
+	authSrv := New(nil)
+	authNs := authSrv.DefaultNamespace()
+	authNs.Use(func(s *Socket) error {
+		if s.Handshake()["token"] != "sekrit" {
+			return errors.New("invalid credentials")
+		}
+		return nil
+	})
+	authTS := httptest.NewServer(authSrv)
+	defer authTS.Close()
+
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
@@ -82,7 +96,7 @@ func TestJSInterop(t *testing.T) {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, node, "interop.mjs")
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "INTEROP_URL="+ts.URL)
+	cmd.Env = append(os.Environ(), "INTEROP_URL="+ts.URL, "INTEROP_AUTH_URL="+authTS.URL)
 	out, err := cmd.CombinedOutput()
 	t.Logf("interop output:\n%s", out)
 	if err != nil {

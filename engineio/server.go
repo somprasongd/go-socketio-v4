@@ -117,6 +117,10 @@ func (srv *Server) serveHandshake(w http.ResponseWriter, r *http.Request) {
 
 // ServeHTTP routes one Engine.IO HTTP request.
 func (srv *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if origin := r.Header.Get("Origin"); origin != "" && !srv.opts.allowsOrigin(origin) {
+		http.Error(w, "origin not allowed", http.StatusForbidden)
+		return
+	}
 	q := r.URL.Query()
 	if q.Get("EIO") != "4" {
 		http.Error(w, "unsupported protocol version", http.StatusBadRequest)

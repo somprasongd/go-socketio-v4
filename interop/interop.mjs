@@ -128,5 +128,23 @@ check("connect websocket-only", true);
     `reason was ${reason}`);
 }
 
+// --- 8. connection middleware: auth enforced ------------------------------
+{
+  const authURL = process.env.INTEROP_AUTH_URL;
+  if (!authURL) {
+    check("middleware auth scenario", false, "INTEROP_AUTH_URL not set");
+  } else {
+    const refused = io(authURL, { auth: { token: "wrong" }, transports: ["websocket"] });
+    const [err] = await once(refused, "connect_error", "refused connection");
+    check("middleware refuses bad token", /invalid credentials/i.test(err?.message || ""),
+      JSON.stringify(err?.message));
+
+    const allowed = io(authURL, { auth: { token: "sekrit" }, transports: ["websocket"] });
+    await once(allowed, "connect", "authorized connect");
+    check("middleware accepts good token", true);
+    allowed.disconnect();
+  }
+}
+
 console.log(results.every((r) => r.ok) ? "ALL INTEROP TESTS PASSED" : "INTEROP FAILURES PRESENT");
 process.exit(results.every((r) => r.ok) ? 0 : 1);
