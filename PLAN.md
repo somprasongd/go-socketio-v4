@@ -23,7 +23,7 @@ Socket.IO v4 + Engine.IO v4 server implementation สำหรับ Go — **�
 | M2 session manager + polling transport | #2 | ✅ เสร็จ |
 | M3 websocket transport + upgrade dance | #3 | ✅ เสร็จ |
 | M4 engine.io compliance harness (official suite) | #4 | ✅ เสร็จ — 24/24 ผ่าน |
-| M5 socket.io parser v5 (text + binary attachments) | #5 | 🔲 รอทำ |
+| M5 socket.io parser v5 (text + binary attachments) | #5 | ✅ เสร็จ |
 | M6 socket.io server core: nsp/rooms/ack/broadcast | #6 | 🔲 รอทำ |
 | M7 public API + http.Handler wiring + e2e | #7 | 🔲 รอทำ |
 | M8 JS interop tests (socket.io-client v4 จริง) | #8 | 🔲 รอทำ |
@@ -108,7 +108,15 @@ git init, go.mod (`github.com/somprasongd/go-socketio-v4`, go 1.27), MIT LICENSE
 - **เกณฑ์ตรวจ:** suite ผ่าน หรือถ้า suite ติดขัดด้าน environment ให้เหลือ Go-side protocol
   tests ครบ + บันทึกเหตุผลและวิธีรันชัดเจน
 
-### M5 — socket.io parser v5 (issue #5)
+### M5 — socket.io parser v5 (issue #5) ✅
+
+> เสร็จ: `parser` package — Type 0–6, `Decode(text, attachments)` /
+> `Encode(packet) (text, attachments)`, format
+> `<type>[<n>-][<nsp>,][<ack id>]<json>`; binary ทำงานสองทาง: decode แทน
+> placeholder ด้วย []byte ตรวจจำนวนให้ตรง declaration, encode หยิบ []byte
+> ที่ซ่อนใน args ทุกความลึกออกเป็น attachments เอง
+> ตรวจแล้ว: golden tests ใช้ตัวอย่าง byte-exact จาก spec + round-trip
+> (รวมข้อความไทย TIS-free UTF-8) + 16 error cases เขียว
 
 - Packet types: 0 CONNECT, 1 DISCONNECT, 2 EVENT, 3 ACK, 4 CONNECT_ERROR,
   5 BINARY_EVENT, 6 BINARY_ACK; format `<type>[<n>-][<nsp>,][<ack id>]<json>`
