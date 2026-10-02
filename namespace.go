@@ -24,8 +24,7 @@ type Namespace struct {
 	name string // "/" or "/admin" style
 
 	mu      sync.RWMutex
-	sockets map[string]*Socket              // by socket id
-	rooms   map[string]map[*Socket]struct{} // by room name
+	adapter Adapter
 
 	onConnect    func(*Socket)
 	onDisconnect func(*Socket, string)
@@ -37,14 +36,29 @@ func newNamespace(srv *Server, name string) *Namespace {
 	return &Namespace{
 		srv:     srv,
 		name:    name,
-		sockets: make(map[string]*Socket),
-		rooms:   make(map[string]map[*Socket]struct{}),
+		adapter: NewInMemoryAdapter(),
 		events:  make(map[string]EventHandler),
 	}
 }
 
 // Name is the namespace's identifier: "/" for the default one.
 func (ns *Namespace) Name() string { return ns.name }
+
+// SetAdapter replaces the membership adapter — for example the package's
+// in-memory one with the redisadapter's. Do it before serving; swapping
+// while clients are connected drops their room memberships.
+func (ns *Namespace) SetAdapter(a Adapter) {
+	ns.mu.Lock()
+	ns.adapter = a
+	ns.mu.Unlock()
+}
+
+// adapterOf snapshots the current adapter.
+func (ns *Namespace) adapterOf() Adapter {
+	ns.mu.RLock()
+	defer ns.mu.RUnlock()
+	return ns.adapter
+}
 
 // Use registers a connection middleware. Middlewares run in registration
 // order for every incoming CONNECT, before the connection is accepted;
@@ -92,21 +106,27 @@ func (ns *Namespace) OnEvent(event string, fn EventHandler) {
 	ns.mu.Unlock()
 }
 
-// Sockets lists the currently connected socket ids.
+// Sockets lists the currently connected socket ids (local sockets only when
+// a cross-process adapter is in place).
 func (ns *Namespace) Sockets() []string {
-	ns.mu.RLock()
-	defer ns.mu.RUnlock()
-	ids := make([]string, 0, len(ns.sockets))
-	for id := range ns.sockets {
-		ids = append(ids, id)
+	sockets := ns.adapterOf().All()
+	ids := make([]string, 0, len(sockets))
+	for _, s := range sockets {
+		ids = append(ids, s.ID())
 	}
 	sort.Strings(ids)
 	return ids
 }
 
+// FetchSockets returns the connected sockets (local only under a
+// cross-process adapter).
+func (ns *Namespace) FetchSockets() []*Socket {
+	return ns.adapterOf().All()
+}
+
 // Emit sends the event to every connected socket of the namespace.
 func (ns *Namespace) Emit(event string, args ...any) {
-	ns.target(nil, nil).Emit(event, args...)
+	ns.adapterOf().Broadcast(nil, event, args, nil, false)
 }
 
 // Volatile returns a namespace-wide target whose emits may be dropped for
@@ -118,43 +138,22 @@ func (ns *Namespace) Volatile() *BroadcastTarget {
 // To — alias of In — targets a room: only sockets that joined it receive
 // what the returned target emits.
 func (ns *Namespace) To(room string) *BroadcastTarget {
-	return ns.target([]string{room}, nil)
+	return &BroadcastTarget{ns: ns, rooms: []string{room}}
 }
 
 // In targets a room; identical to To.
 func (ns *Namespace) In(room string) *BroadcastTarget { return ns.To(room) }
 
-// FetchSockets returns the connected sockets (for direct inspection).
-func (ns *Namespace) FetchSockets() []*Socket {
-	ns.mu.RLock()
-	defer ns.mu.RUnlock()
-	out := make([]*Socket, 0, len(ns.sockets))
-	for _, s := range ns.sockets {
-		out = append(out, s)
-	}
-	return out
-}
-
-func (ns *Namespace) target(rooms []string, except map[*Socket]struct{}) *BroadcastTarget {
+func (ns *Namespace) target(rooms []string, except map[string]struct{}) *BroadcastTarget {
 	return &BroadcastTarget{ns: ns, rooms: rooms, except: except}
 }
 
 func (ns *Namespace) addSocket(s *Socket) {
-	ns.mu.Lock()
-	ns.sockets[s.id] = s
-	ns.mu.Unlock()
+	ns.adapterOf().AddSocket(s)
 }
 
 func (ns *Namespace) removeSocket(s *Socket) {
-	ns.mu.Lock()
-	delete(ns.sockets, s.id)
-	for room, members := range ns.rooms {
-		delete(members, s)
-		if len(members) == 0 {
-			delete(ns.rooms, room)
-		}
-	}
-	ns.mu.Unlock()
+	ns.adapterOf().RemoveSocket(s)
 }
 
 func (ns *Namespace) fireConnect(s *Socket) {
@@ -188,27 +187,4 @@ func (ns *Namespace) fireEvent(s *Socket, event string, args []any, ack func(res
 		return
 	}
 	fn(s, args, ack)
-}
-
-// joinRoom puts the socket in a room, creating it.
-func (ns *Namespace) joinRoom(s *Socket, room string) {
-	ns.mu.Lock()
-	set := ns.rooms[room]
-	if set == nil {
-		set = make(map[*Socket]struct{})
-		ns.rooms[room] = set
-	}
-	set[s] = struct{}{}
-	ns.mu.Unlock()
-}
-
-func (ns *Namespace) leaveRoom(s *Socket, room string) {
-	ns.mu.Lock()
-	if set := ns.rooms[room]; set != nil {
-		delete(set, s)
-		if len(set) == 0 {
-			delete(ns.rooms, room)
-		}
-	}
-	ns.mu.Unlock()
 }

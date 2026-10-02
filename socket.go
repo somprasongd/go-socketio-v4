@@ -1,7 +1,6 @@
 package socketio
 
 import (
-	"sort"
 	"sync"
 
 	"github.com/somprasongd/go-socketio-v4/parser"
@@ -94,37 +93,29 @@ func (s *Socket) EmitWithAck(event string, args ...any) <-chan []any {
 // Join puts the socket in a room. Rooms are per-namespace and vanish when
 // empty.
 func (s *Socket) Join(room string) {
-	s.ns.joinRoom(s, room)
+	s.ns.adapterOf().Add(s, room)
 }
 
 // Leave removes the socket from a room.
 func (s *Socket) Leave(room string) {
-	s.ns.leaveRoom(s, room)
+	s.ns.adapterOf().Del(s, room)
 }
 
-// Rooms lists the rooms the socket is in.
+// Rooms lists the rooms the socket is in (local rooms only under a
+// cross-process adapter).
 func (s *Socket) Rooms() []string {
-	s.ns.mu.RLock()
-	defer s.ns.mu.RUnlock()
-	var rooms []string
-	for room, members := range s.ns.rooms {
-		if _, ok := members[s]; ok {
-			rooms = append(rooms, room)
-		}
-	}
-	sort.Strings(rooms)
-	return rooms
+	return s.ns.adapterOf().SocketRooms(s)
 }
 
 // Broadcast targets every socket of the namespace except this one.
 func (s *Socket) Broadcast() *BroadcastTarget {
-	return s.ns.target(nil, map[*Socket]struct{}{s: {}})
+	return s.ns.target(nil, map[string]struct{}{s.ID(): {}})
 }
 
 // To targets a room, excluding this socket — the socket.io "rooms I am in,
 // minus me" idiom.
 func (s *Socket) To(room string) *BroadcastTarget {
-	return s.ns.target([]string{room}, map[*Socket]struct{}{s: {}})
+	return s.ns.target([]string{room}, map[string]struct{}{s.ID(): {}})
 }
 
 // Disconnect closes the namespace connection from the server side. The
@@ -162,11 +153,11 @@ func (s *Socket) sendEvent(base parser.Type, event string, args []any, ackID int
 	})
 }
 
-// BroadcastTarget collects recipients for an emit.
+// BroadcastTarget collects recipients for an emit. except holds socket ids.
 type BroadcastTarget struct {
 	ns       *Namespace
 	rooms    []string
-	except   map[*Socket]struct{}
+	except   map[string]struct{}
 	volatile bool
 }
 
@@ -181,31 +172,8 @@ func (t *BroadcastTarget) Volatile() *BroadcastTarget {
 	return &BroadcastTarget{ns: t.ns, rooms: t.rooms, except: t.except, volatile: true}
 }
 
-// Emit sends the event to every socket in the target.
+// Emit sends the event to every socket in the target. Under a cross-process
+// adapter the delivery happens on every process that holds matching sockets.
 func (t *BroadcastTarget) Emit(event string, args ...any) {
-	t.ns.mu.RLock()
-	recipients := make(map[*Socket]struct{})
-	if len(t.rooms) == 0 {
-		for _, s := range t.ns.sockets {
-			recipients[s] = struct{}{}
-		}
-	} else {
-		for _, room := range t.rooms {
-			for s := range t.ns.rooms[room] {
-				recipients[s] = struct{}{}
-			}
-		}
-	}
-	t.ns.mu.RUnlock()
-
-	for s := range recipients {
-		if _, skip := t.except[s]; skip {
-			continue
-		}
-		if t.volatile {
-			_ = s.Volatile().Emit(event, args...)
-			continue
-		}
-		_ = s.Emit(event, args...)
-	}
+	t.ns.adapterOf().Broadcast(t.rooms, event, args, t.except, t.volatile)
 }

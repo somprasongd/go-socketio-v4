@@ -219,3 +219,17 @@ git init, go.mod (`github.com/somprasongd/go-socketio-v4`, go 1.27), MIT LICENSE
 > `Socket.Volatile()` / `BroadcastTarget.Volatile()` / `Namespace.Volatile()`
 > — emit โดนทิ้งเงียบ ๆ เมื่อ client รับไม่ได้ ณ ตอนนั้น, plain Emit
 > ไม่เคยถูก drop; ทดสอบทั้งกรณี drop/deliver/broadcast ผสม
+
+### M12 — adapter interface + Redis adapter (#12) ✅
+
+> แยก `socketio.Adapter` interface (AddSocket/RemoveSocket/Add/Del/All/
+> Members/SocketRooms/Broadcast) + `InMemoryAdapter` default (พฤติกรรมเดิม
+> ทุกอย่าง, tests เดิมผ่านหมดโดยไม่แก้); except เปลี่ยนเป็น map[socketID]
+> เพื่อให้ข้าม process ได้
+> `redisadapter`: Broadcast = publish JSON ลง channel → ทุก instance
+> (รวมตัวเอง) deliver ให้ member ของตัวเองผ่าน subscription; membership
+> เป็น local per-process (เอกสารชัด); binary ใน args เดินทางด้วย
+> base64 marker; test hermetic ด้วย miniredis — 3 server process จำลอง
+> (cross-process broadcast, room scoping, binary relay, namespace isolation)
+> บทเรียน: gorilla ห้าม read ซ้ำหลัง read error → negative assertion
+> ต้องใช้ reader goroutine; CONNECT ข้าม namespace ต้องมี comma ปิดท้าย
