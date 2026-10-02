@@ -27,7 +27,7 @@ Socket.IO v4 + Engine.IO v4 server implementation สำหรับ Go — **�
 | M6 socket.io server core: nsp/rooms/ack/broadcast | #6 | ✅ เสร็จ |
 | M7 public API + http.Handler wiring + e2e | #7 | ✅ เสร็จ |
 | M8 JS interop tests (socket.io-client v4 จริง) | #8 | ✅ เสร็จ — 11/11 ผ่าน |
-| M9 docs + example + สรุปสถานะ | #9 | 🔲 รอทำ |
+| M9 docs + example + สรุปสถานะ | #9 | ✅ เสร็จ — v0.1.0 |
 
 ## รายละเอียดแต่ละ milestone
 
@@ -178,7 +178,25 @@ git init, go.mod (`github.com/somprasongd/go-socketio-v4`, go 1.27), MIT LICENSE
 - รันผ่าน `go test` ที่ spawn node; ถ้าไม่มี node ให้ skip พร้อมเหตุผลชัดเจน
 - **เกณฑ์ตรวจ:** ผ่านด้วย node ในเครื่องนี้ (v24 มีอยู่จริง)
 
-### M9 — docs + example + สรุป (issue #9)
+### M9 — docs + example + สรุป (issue #9) ✅ v0.1.0
+
+> เสร็จ: README ครบ (quick start, API, ตาราง protocol support, วิธีรัน
+> ทุกชุดทดสอบ, เหตุผลที่เขียนใหม่), `cmd/example` (echo/broadcast/room/
+> binary — ผ่านการ smoke test กับ socket.io-client จริง: welcome, echo ack,
+> photo binary, disconnect เหตุผลถูกต้อง), `make compliance`
+> สถานะสุดท้าย: tag v0.1.0
+
+## สรุปตอนจบ
+
+- **ตัวเลขรวม:** official engine.io compliance suite 24/24 ✅ · JS interop
+  (socket.io-client v4.8.4) 11/11 ✅ · unit/golden/e2e tests เขียวทั้งหมด ·
+  `go test -race` ผ่าน · vet + gofmt สะอาด · dependency ภายนอกมีแค่
+  gorilla/websocket
+- **ที่มาของแต่ละการแก้สำคัญ** อ่านได้จากหัวข้อ milestone ข้างบน — สองจุดที่
+  spec ไม่ได้บอกชัดและต้องเรียนจาก suite/interop คือทิศ heartbeat ของ
+  engine.io 6.4+ และพฤติกรรม flush/noop รอบ ๆ การ upgrade
+- **ยังไม่รองรับ (documented):** middleware, volatile events, Redis adapter,
+  connection-state recovery
 
 - README: การติดตั้ง, ตัวอย่างใช้งาน, ตาราง protocol support, วิธีรัน compliance/interop tests
 - `cmd/example`: echo server สาธิต API

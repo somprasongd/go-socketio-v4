@@ -1,4 +1,4 @@
-.PHONY: build test race vet fmt check
+.PHONY: build test race vet fmt check compliance
 
 build:
 	go build ./...
@@ -17,3 +17,6 @@ fmt:
 
 check: build test vet
 	@echo "gofmt:" && test -z "$$(gofmt -l .)"
+
+compliance:
+	./compliance/run.sh
