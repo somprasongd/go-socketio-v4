@@ -85,6 +85,39 @@ admin := srv.Of("/admin")
 admin.OnConnect(func(s *socketio.Socket) { s.Emit("welcome", "admin here") })
 ```
 
+Connection middleware enforces credentials before the namespace accepts a
+client — the CONNECT auth payload (`io(url, { auth: { token } })`) arrives
+as `Socket.Handshake()`, and a middleware error becomes a CONNECT_ERROR:
+
+```go
+ns.Use(func(s *socketio.Socket) error {
+	if s.Handshake()["token"] != expected {
+		return errors.New("invalid credentials")
+	}
+	return nil
+})
+```
+
+Connection-state recovery keeps a session across an unexpected drop:
+
+```go
+ns.EnableRecovery(nil) // or &socketio.RecoveryOptions{...}
+ns.OnConnect(func(s *socketio.Socket) {
+	if s.Recovered() {
+		log.Println("welcome back", s.ID()) // same id, rooms and data
+	}
+})
+```
+
+Running several processes behind a load balancer, relay broadcasts through
+Redis (membership stays local per process):
+
+```go
+import "github.com/somprasongd/go-socketio-v4/redisadapter"
+
+ns.SetAdapter(redisadapter.New("/", rdb, "my-app-relay"))
+```
+
 ## Protocol support
 
 | Layer | Feature | Status |
@@ -97,7 +130,11 @@ admin.OnConnect(func(s *socketio.Socket) { s.Emit("welcome", "admin here") })
 | Socket.IO v4 | default + custom namespaces, auth payload, CONNECT_ERROR | ✅ |
 | Socket.IO v4 | events, acks in both directions, binary attachments | ✅ |
 | Socket.IO v4 | rooms, broadcast, socket.To / Broadcast / namespace.Emit | ✅ |
-| Socket.IO v4 | middleware hooks, volatile events, Redis adapter, connection-state recovery | not yet |
+| Socket.IO v4 | volatile emits (drop instead of buffer when the client cannot receive) | ✅ |
+| Socket.IO v4 | connection middleware (`ns.Use`) with the CONNECT auth payload | ✅ |
+| Socket.IO v4 | connection-state recovery (pid/offset, id+rooms+data restored, replay) | ✅ |
+| Socket.IO v4 | cross-process broadcasting (`redisadapter`) | ✅ |
+| Socket.IO v4 | volatile over cross-process relay, Redis-Streams recovery store | partial |
 
 Disconnect reasons reach `OnDisconnect` in socket.io's vocabulary:
 `io client disconnect`, `io server disconnect`, `transport close`,
@@ -123,8 +160,8 @@ The Go ecosystem had no maintained Socket.IO v4 server: `googollee/go-socket.io`
 stopped at protocol v2, and the small v4 implementations are websocket-only,
 which breaks the polling-first default of real clients. This project ports
 the *behaviour* described by the specs (not the TypeScript code) and keeps
-the official suites as the acceptance gates. `docs` on the reasoning live in
-[PLAN.md](PLAN.md).
+the official suites as the acceptance gates. The reasoning and the
+milestone-by-milestone record live in [PLAN.md](PLAN.md).
 
 ## License
 

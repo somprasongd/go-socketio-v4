@@ -248,3 +248,20 @@ git init, go.mod (`github.com/somprasongd/go-socketio-v4`, go 1.27), MIT LICENSE
 > membership ก่อนไม่ได้); client JS ไม่ strip offset — handler ต้องรับ
 > arg ท้ายเอง ตามที่แอป socket.io จริงต้องเขียน; `socket.disconnect()`
 > ฝั่ง client ไม่มีทาง recover เพราะเป็น intentional
+
+## สรุปตอนจบ v0.2.0
+
+- **ตัวเลขรวม:** official compliance suite 24/24 ✅ · JS interop
+  (socket.io-client v4.8.4) **17/17** ✅ · `go test -race` ทุก package ✅ ·
+  vet + gofmt สะอาด
+- **4 features ใหม่:** middleware + auth payload + origin allow-list (#10),
+  volatile emits (#11), Adapter interface + Redis relay (#12),
+  connection-state recovery (#13) — แต่ละตัวแยก commit + issue
+- **interop เพิ่ม 4 scenario:** auth ผิด/ถูกผ่าน middleware,
+  recovery ครบวงรอบ (seed → engine.close → fire ระหว่างหลุด → reconnect →
+  recovered=true + replay + rooms คืน)
+- **ข้อจำกัดที่ยังเหลือ (documented):** volatile ยังไม่ทำงานข้าม process ใน
+  redis relay (drop rule เป็นของ local), recovery store เป็น in-memory
+  (ข้าม process ต้องใช้ adapter ที่ support เช่น Redis Streams — ยังไม่มี),
+  client JS จะเห็น offset เป็น arg ท้ายของทุก event เมื่อเปิด recovery
+  (พฤติกรรมเดียวกับ socket.io ทางการ)
