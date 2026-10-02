@@ -1,11 +1,10 @@
 package socketio
 
 import (
+	"crypto/rand"
 	"encoding/hex"
 	"log"
 	"sync"
-
-	"crypto/rand"
 
 	"github.com/somprasongd/go-socketio-v4/parser"
 )
@@ -13,23 +12,27 @@ import (
 // client is one Socket.IO client: everything riding a single engine.io
 // session — its namespace connections and the ack bookkeeping.
 //
-// Two locks, always taken in this order: mu guards the inbound packet state
-// machine (so packets stay ordered), sendMu guards the wire sequence (a
-// BINARY_EVENT's attachments must directly follow its text packet). User
-// handlers run under mu, and their Sends take sendMu — never the reverse —
-// which is what keeps handler echoes deadlock-free.
+// Three locks, always taken in this order: handlerMu serialises the whole
+// packet pipeline (decode, handlers, replies) so handlers see packets in
+// order; mu guards the client state (connections, closed flag, the binary
+// attachment buffer); sendMu guards the wire sequence, because a binary
+// event's attachments must directly follow its text packet.
+//
+// User handlers run while handlerMu is held but mu released, so a handler
+// may call back into the client (Socket.Disconnect takes mu) without
+// deadlocking. Echoing through Send takes only sendMu.
 type client struct {
 	srv  *Server
 	sess sendSink
 
-	mu       sync.Mutex
-	conns    map[string]*Socket // by namespace name
-	needBin  int
-	binText  string
-	bins     [][]byte
-	closed   bool
-	reason   string
-	dispatch *sync.Cond
+	handlerMu sync.Mutex
+
+	mu      sync.Mutex
+	conns   map[string]*Socket // by namespace name
+	needBin int
+	binText string
+	bins    [][]byte
+	closed  bool
 
 	sendMu sync.Mutex
 
@@ -39,28 +42,33 @@ type client struct {
 }
 
 func newClient(srv *Server, sess sendSink) *client {
-	c := &client{
+	return &client{
 		srv:      srv,
 		sess:     sess,
 		conns:    make(map[string]*Socket),
 		ackWaits: make(map[int64]chan []any),
 	}
-	c.dispatch = sync.NewCond(&c.mu)
-	return c
 }
 
-// onMessage runs one inbound packet through the state machine. Binary
-// Engine.IO packets only make sense as attachments of a binary text packet,
-// so the client buffers until the declared count arrives.
+// onMessage runs one inbound packet through the pipeline. Binary engine.io
+// packets only make sense as attachments of a binary text packet, so the
+// client buffers until the declared count arrives.
 func (c *client) onMessage(data []byte, isBinary bool) {
+	c.handlerMu.Lock()
+	defer c.handlerMu.Unlock()
+
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
 		return
 	}
-	if c.needBin > 0 {
+	var text string
+	var bins [][]byte
+	switch {
+	case c.needBin > 0:
 		if !isBinary {
-			c.killLocked(reasonParseError)
+			c.mu.Unlock()
+			c.kill(reasonParseError)
 			return
 		}
 		c.bins = append(c.bins, data)
@@ -68,36 +76,37 @@ func (c *client) onMessage(data []byte, isBinary bool) {
 			c.mu.Unlock()
 			return
 		}
-		text, bins := c.binText, c.bins
+		text, bins = c.binText, c.bins
 		c.needBin, c.binText, c.bins = 0, "", nil
-		c.handlePacketLocked(text, bins)
-		c.mu.Unlock()
-		return
-	}
-	if isBinary {
+	case isBinary:
 		// Attachments never travel without their text packet in front.
-		c.killLocked(reasonParseError)
-		return
-	}
-	if n := parser.NeededAttachments(string(data)); n > 0 {
-		c.needBin, c.binText, c.bins = n, string(data), nil
 		c.mu.Unlock()
+		c.kill(reasonParseError)
 		return
+	default:
+		if n := parser.NeededAttachments(string(data)); n > 0 {
+			c.needBin, c.binText, c.bins = n, string(data), nil
+			c.mu.Unlock()
+			return
+		}
+		text = string(data)
 	}
-	c.handlePacketLocked(string(data), nil)
-	c.mu.Unlock()
-}
 
-// handlePacketLocked decodes and dispatches one packet. Decode failures end
-// the client with a parse error, mirroring the JS server.
-func (c *client) handlePacketLocked(text string, bins [][]byte) {
 	pkt, err := parser.Decode(text, bins)
 	if err != nil {
 		log.Printf("socketio: dropping client %s: %v", c.sess.ID(), err)
-		c.killLocked(reasonParseError)
+		c.mu.Unlock()
+		c.kill(reasonParseError)
 		return
 	}
+	c.mu.Unlock()
 
+	c.route(pkt)
+}
+
+// route dispatches one decoded packet. Everything here runs with mu
+// released; state mutations grab it only for the length of the mutation.
+func (c *client) route(pkt parser.Packet) {
 	name := pkt.Namespace
 	if name == "" {
 		name = "/"
@@ -105,17 +114,11 @@ func (c *client) handlePacketLocked(text string, bins [][]byte) {
 
 	switch pkt.Type {
 	case parser.Connect:
-		c.handleConnectLocked(name)
-
+		c.routeConnect(name)
 	case parser.Disconnect:
-		if s := c.conns[name]; s != nil {
-			c.removeConnLocked(s)
-			s.ns.fireDisconnect(s, reasonClientDisconnect)
-		}
-
+		c.routeDisconnect(name)
 	case parser.Event, parser.BinaryEvent:
-		c.handleEventLocked(name, pkt)
-
+		c.routeEvent(name, pkt)
 	case parser.Ack, parser.BinaryAck:
 		if !pkt.HasID {
 			return // nothing to match; ignore
@@ -130,16 +133,20 @@ func (c *client) handlePacketLocked(text string, bins [][]byte) {
 	}
 }
 
-// handleConnectLocked opens a namespace connection. Unknown namespaces are
-// refused with CONNECT_ERROR, as the spec requires.
-func (c *client) handleConnectLocked(name string) {
-	if c.conns[name] != nil {
-		return // already connected; ignore the repeat
+// routeConnect opens a namespace connection. Unknown namespaces are refused
+// with CONNECT_ERROR, as the spec requires.
+func (c *client) routeConnect(name string) {
+	c.mu.Lock()
+	if c.closed || c.conns[name] != nil {
+		// already connected; ignore the repeat
+		c.mu.Unlock()
+		return
 	}
 	c.srv.mu.Lock()
 	ns := c.srv.namespaceLocked(name)
 	c.srv.mu.Unlock()
 	if ns == nil {
+		c.mu.Unlock()
 		c.sendPacket(parser.Packet{
 			Type:      parser.ConnectError,
 			Namespace: nsName(name),
@@ -147,12 +154,10 @@ func (c *client) handleConnectLocked(name string) {
 		})
 		return
 	}
-	s := &Socket{
-		id: newSocketID(),
-		ns: ns,
-		c:  c,
-	}
+	s := &Socket{id: newSocketID(), ns: ns, c: c}
 	c.conns[name] = s
+	c.mu.Unlock()
+
 	ns.addSocket(s)
 	c.sendPacket(parser.Packet{
 		Type:      parser.Connect,
@@ -162,11 +167,28 @@ func (c *client) handleConnectLocked(name string) {
 	ns.fireConnect(s)
 }
 
-func (c *client) handleEventLocked(name string, pkt parser.Packet) {
+func (c *client) routeDisconnect(name string) {
+	c.mu.Lock()
 	s := c.conns[name]
+	if s == nil {
+		c.mu.Unlock()
+		return
+	}
+	delete(c.conns, name)
+	c.mu.Unlock()
+
+	s.ns.removeSocket(s)
+	s.ns.fireDisconnect(s, reasonClientDisconnect)
+}
+
+func (c *client) routeEvent(name string, pkt parser.Packet) {
+	c.mu.Lock()
+	s := c.conns[name]
+	c.mu.Unlock()
 	if s == nil {
 		return // events for a namespace we never connected; ignore
 	}
+
 	args := pkt.Args()
 	event, _ := args[0].(string)
 	rest := args[1:]
@@ -175,7 +197,7 @@ func (c *client) handleEventLocked(name string, pkt parser.Packet) {
 	if pkt.HasID {
 		id := pkt.ID
 		ack = func(response ...any) {
-			// A late ack after the client is gone is dropped by SendPacket.
+			// A late ack after the client is gone is dropped by the sink.
 			c.sendPacket(parser.Packet{
 				Type:      parser.Ack,
 				Namespace: nsName(name),
@@ -188,26 +210,16 @@ func (c *client) handleEventLocked(name string, pkt parser.Packet) {
 	s.ns.fireEvent(s, event, rest, ack)
 }
 
-// removeConnLocked drops the namespace connection from the client.
-func (c *client) removeConnLocked(s *Socket) {
-	delete(c.conns, s.ns.name)
-	s.ns.removeSocket(s)
-}
-
-// kill ends the client after a transport-level close, notifying every
-// namespace connection and releasing pending acks.
+// kill ends the client after a transport-level close or a parse error:
+// notifying every namespace connection, releasing pending acks, and
+// unregistering. Idempotent; safe from any goroutine.
 func (c *client) kill(reason string) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.killLocked(reason)
-}
-
-func (c *client) killLocked(reason string) {
 	if c.closed {
+		c.mu.Unlock()
 		return
 	}
 	c.closed = true
-	c.reason = reason
 	conns := make([]*Socket, 0, len(c.conns))
 	for _, s := range c.conns {
 		conns = append(conns, s)
@@ -215,19 +227,20 @@ func (c *client) killLocked(reason string) {
 	c.conns = map[string]*Socket{}
 	for _, s := range conns {
 		s.ns.removeSocket(s)
-		s.ns.fireDisconnect(s, reason)
 	}
-	c.dispatch.Broadcast()
-
 	c.ackMu.Lock()
 	waits := c.ackWaits
 	c.ackWaits = map[int64]chan []any{}
 	c.ackMu.Unlock()
+	c.srv.removeClient(c.sess)
+	c.mu.Unlock()
+
 	for _, wait := range waits {
 		close(wait) // closed empty: the caller's wait sees a timeout
 	}
-
-	c.srv.removeClient(c.sess)
+	for _, s := range conns {
+		s.ns.fireDisconnect(s, reason)
+	}
 }
 
 // sendPacket encodes and transmits one packet, attachments and all, as an

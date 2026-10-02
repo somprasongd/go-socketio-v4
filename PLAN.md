@@ -26,7 +26,7 @@ Socket.IO v4 + Engine.IO v4 server implementation สำหรับ Go — **�
 | M5 socket.io parser v5 (text + binary attachments) | #5 | ✅ เสร็จ |
 | M6 socket.io server core: nsp/rooms/ack/broadcast | #6 | ✅ เสร็จ |
 | M7 public API + http.Handler wiring + e2e | #7 | ✅ เสร็จ |
-| M8 JS interop tests (socket.io-client v4 จริง) | #8 | 🔲 รอทำ |
+| M8 JS interop tests (socket.io-client v4 จริง) | #8 | ✅ เสร็จ — 11/11 ผ่าน |
 | M9 docs + example + สรุปสถานะ | #9 | 🔲 รอทำ |
 
 ## รายละเอียดแต่ละ milestone
@@ -160,7 +160,18 @@ git init, go.mod (`github.com/somprasongd/go-socketio-v4`, go 1.27), MIT LICENSE
 - **เกณฑ์ตรวจ:** e2e httptest ด้วย client จริงฝั่ง Go: connect → event → ack →
   broadcast → disconnect; `go test -race` ผ่าน
 
-### M8 — JS interop tests (issue #8)
+### M8 — JS interop tests (issue #8) ✅ 11/11 ผ่าน
+
+> เสร็จ: `interop/interop.mjs` ใช้ socket.io-client v4.8.4 จริง,
+> `interop_test.go` spawn node (skip พร้อมเหตุผลเมื่อไม่มี node/npm)
+> ครอบคลุม: polling-first connect + upgrade เป็น websocket (ตรวจ transport
+> ที่ client ใช้จริง), ws-only, client event + ack, server EmitWithAck →
+> client ตอบ, binary ขึ้น-ลง, room broadcast, socket.To ตัด sender,
+> custom namespace, server-side kick
+> บั๊กที่ interop จับได้: handler ที่เรียก `Socket.Disconnect()` deadlock
+> เพราะ handler เคยรันใต้ `c.mu` — จัดโครงใหม่เป็น 3 locks (handlerMu →
+> mu → sendMu) โดย handler รันนอก `c.mu`
+> ตรวจแล้ว: 11/11 PASS + `go test -race` + รันซ้ำ 3 ครั้งสม่ำเสมอ
 
 - Node script ใช้ `socket.io-client` v4 จริง: connect (polling-first default), ws-only,
   ack, binary ส่ง/รับ, broadcast, reconnect หลัง server ปิด-เปิด

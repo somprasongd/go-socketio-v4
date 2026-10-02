@@ -1,0 +1,9 @@
+{
+  "name": "go-socketio-v4-interop",
+  "private": true,
+  "type": "module",
+  "description": "Interoperability tests: the real socket.io v4 client against the Go server",
+  "dependencies": {
+    "socket.io-client": "^4.8.1"
+  }
+}

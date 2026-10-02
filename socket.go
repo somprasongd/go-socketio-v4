@@ -104,18 +104,19 @@ func (s *Socket) To(room string) *BroadcastTarget {
 
 // Disconnect closes the namespace connection from the server side. The
 // client is told with a disconnect packet and OnDisconnect fires with
-// "io server disconnect".
+// "io server disconnect". Safe to call from inside handlers.
 func (s *Socket) Disconnect() {
 	c := s.c
 	c.mu.Lock()
 	if c.conns[s.ns.name] == s {
-		c.removeConnLocked(s)
+		delete(c.conns, s.ns.name)
 		c.sendPacket(parser.Packet{
 			Type:      parser.Disconnect,
 			Namespace: nsName(s.ns.name),
 		})
 	}
 	c.mu.Unlock()
+	s.ns.removeSocket(s)
 	s.ns.fireDisconnect(s, reasonServerDisconnect)
 }
 
