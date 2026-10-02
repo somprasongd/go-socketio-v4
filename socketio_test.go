@@ -12,20 +12,27 @@ import (
 // fakeSink is an in-memory engine.io session: it records what the server
 // sends and lets tests push client packets in.
 type fakeSink struct {
-	id   string
-	mu   sync.Mutex
-	sent []string // wire pieces in order: text packets and hex-tagged binaries
-	done chan struct{}
-	srv  *Server
+	id       string
+	mu       sync.Mutex
+	sent     []string // wire pieces in order: text packets and hex-tagged binaries
+	done     chan struct{}
+	srv      *Server
+	writable bool
 }
 
 func newFakeSink(srv *Server) *fakeSink {
-	s := &fakeSink{id: "fake-1", done: make(chan struct{}), srv: srv}
+	s := &fakeSink{id: "fake-1", done: make(chan struct{}), srv: srv, writable: true}
 	srv.attach(s)
 	return s
 }
 
 func (f *fakeSink) ID() string { return f.id }
+
+func (f *fakeSink) Writable() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.writable
+}
 
 func (f *fakeSink) SendText(text string) error {
 	f.mu.Lock()

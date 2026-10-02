@@ -109,6 +109,12 @@ func (ns *Namespace) Emit(event string, args ...any) {
 	ns.target(nil, nil).Emit(event, args...)
 }
 
+// Volatile returns a namespace-wide target whose emits may be dropped for
+// sockets that cannot receive right now. See Socket.Volatile.
+func (ns *Namespace) Volatile() *BroadcastTarget {
+	return &BroadcastTarget{ns: ns, volatile: true}
+}
+
 // To — alias of In — targets a room: only sockets that joined it receive
 // what the returned target emits.
 func (ns *Namespace) To(room string) *BroadcastTarget {

@@ -94,6 +94,22 @@ func newSession(srv *Server) *Session {
 // ID is the Engine.IO session id the client passes back on every request.
 func (s *Session) ID() string { return s.id }
 
+// Writable reports whether the session can deliver packets right now. A
+// WebSocket session is always writable once open; a polling session only
+// while a GET is parked waiting — that is the same "transport.writable"
+// notion socket.io's volatile flag drops packets on.
+func (s *Session) Writable() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return false
+	}
+	if s.ws != nil {
+		return true
+	}
+	return s.polling
+}
+
 // Done is closed when the session ends, for whichever reason.
 func (s *Session) Done() <-chan struct{} { return s.done }
 

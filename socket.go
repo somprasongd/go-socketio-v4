@@ -48,7 +48,26 @@ func (s *Socket) GetData() any {
 // Emit sends an event to this socket. Binary values ([]byte) inside args
 // are carried as protocol attachments automatically.
 func (s *Socket) Emit(event string, args ...any) error {
-	return s.sendEvent(parser.Event, event, args, 0, false)
+	return s.sendEvent(parser.Event, event, args, 0, false, false)
+}
+
+// Volatile returns a view of the socket whose emits are allowed to be
+// dropped: if the client cannot receive right now (no parked poll, or the
+// transport just went away) the event vanishes instead of being buffered.
+// Use it for data where stale is worse than missing — positions, ticks,
+// live counters — never for events the client must not lose.
+func (s *Socket) Volatile() *VolatileSocket {
+	return &VolatileSocket{s: s}
+}
+
+// VolatileSocket emits on a socket with the volatile flag set.
+type VolatileSocket struct {
+	s *Socket
+}
+
+// Emit sends the event, dropping it if the client cannot receive right now.
+func (v *VolatileSocket) Emit(event string, args ...any) error {
+	return v.s.sendEvent(parser.Event, event, args, 0, false, true)
 }
 
 // EmitWithAck sends an event and expects the client to answer. The returned
@@ -63,7 +82,7 @@ func (s *Socket) Emit(event string, args ...any) error {
 func (s *Socket) EmitWithAck(event string, args ...any) <-chan []any {
 	id := s.c.nextAckID()
 	wait := s.c.awaitAck(id)
-	if err := s.sendEvent(parser.Event, event, args, id, true); err != nil {
+	if err := s.sendEvent(parser.Event, event, args, id, true, false); err != nil {
 		s.c.ackMu.Lock()
 		delete(s.c.ackWaits, id)
 		s.c.ackMu.Unlock()
@@ -126,7 +145,11 @@ func (s *Socket) Disconnect() {
 	s.ns.fireDisconnect(s, reasonServerDisconnect)
 }
 
-func (s *Socket) sendEvent(base parser.Type, event string, args []any, ackID int64, hasAck bool) error {
+func (s *Socket) sendEvent(base parser.Type, event string, args []any, ackID int64, hasAck bool, volatile bool) error {
+	if volatile && !s.c.sess.Writable() {
+		// volatile: the client cannot take it this instant; let it go
+		return nil
+	}
 	full := make([]any, 0, len(args)+1)
 	full = append(full, event)
 	full = append(full, args...)
@@ -141,14 +164,21 @@ func (s *Socket) sendEvent(base parser.Type, event string, args []any, ackID int
 
 // BroadcastTarget collects recipients for an emit.
 type BroadcastTarget struct {
-	ns     *Namespace
-	rooms  []string
-	except map[*Socket]struct{}
+	ns       *Namespace
+	rooms    []string
+	except   map[*Socket]struct{}
+	volatile bool
 }
 
 // To widens the target with another room.
 func (t *BroadcastTarget) To(room string) *BroadcastTarget {
-	return &BroadcastTarget{ns: t.ns, rooms: append(append([]string{}, t.rooms...), room), except: t.except}
+	return &BroadcastTarget{ns: t.ns, rooms: append(append([]string{}, t.rooms...), room), except: t.except, volatile: t.volatile}
+}
+
+// Volatile marks the target's emits as droppable: sockets that cannot
+// receive right now are skipped instead of having the event buffered.
+func (t *BroadcastTarget) Volatile() *BroadcastTarget {
+	return &BroadcastTarget{ns: t.ns, rooms: t.rooms, except: t.except, volatile: true}
 }
 
 // Emit sends the event to every socket in the target.
@@ -170,6 +200,10 @@ func (t *BroadcastTarget) Emit(event string, args ...any) {
 
 	for s := range recipients {
 		if _, skip := t.except[s]; skip {
+			continue
+		}
+		if t.volatile {
+			_ = s.Volatile().Emit(event, args...)
 			continue
 		}
 		_ = s.Emit(event, args...)

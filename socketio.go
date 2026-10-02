@@ -20,6 +20,7 @@ type sendSink interface {
 	SendBinary([]byte) error
 	Done() <-chan struct{}
 	Close()
+	Writable() bool
 }
 
 // Server is a Socket.IO v4 endpoint: a set of namespaces fed by engine.io

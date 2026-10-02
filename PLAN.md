@@ -211,3 +211,11 @@ git init, go.mod (`github.com/somprasongd/go-socketio-v4`, go 1.27), MIT LICENSE
 | M11 volatile events | #11 | 🔲 รอทำ |
 | M12 adapter interface + Redis adapter | #12 | 🔲 รอทำ |
 | M13 connection-state recovery | #13 | 🔲 รอทำ |
+
+### M11 — volatile events (#11) ✅
+
+> `engineio.Session.Writable()` = transport.writable ของ socket.io
+> (ws: เปิดแล้ว true; polling: true เฉพาะเมื่อมี parked GET);
+> `Socket.Volatile()` / `BroadcastTarget.Volatile()` / `Namespace.Volatile()`
+> — emit โดนทิ้งเงียบ ๆ เมื่อ client รับไม่ได้ ณ ตอนนั้น, plain Emit
+> ไม่เคยถูก drop; ทดสอบทั้งกรณี drop/deliver/broadcast ผสม
