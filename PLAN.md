@@ -1,0 +1,109 @@
+# แผนดำเนินงาน: go-socketio-v4
+
+Socket.IO v4 + Engine.IO v4 server implementation สำหรับ Go — **เขียนใหม่ตาม protocol spec**
+(ไม่ fork โค้ดเดิม) โดยใช้ official compliance suite และ JS client จริงเป็นตัวตรวจ
+
+- **ที่มา:** Go ecosystem ไม่มี Socket.IO v4 server ที่ mature — `googollee/go-socket.io` หยุดที่
+  protocol v2 และไม่มีคนดูแล; `ffenix113/go-socketio` รองรับ v4 แต่ websocket-only ไม่มี polling
+  ซึ่งเป็น default ของ client จริง จึงเลือกเขียนใหม่จาก spec
+- **Spec อ้างอิง:**
+  - [Engine.IO protocol v4](https://socket.io/docs/v4/engine-io-protocol/) +
+    [compliance test-suite ทางการ](https://github.com/socketio/engine.io-protocol/tree/main/test-suite)
+  - [Socket.IO protocol v5](https://socket.io/docs/v4/socket-io-protocol/)
+- **Dependencies:** `gorilla/websocket` เท่านั้น (polling เป็น net/http ล้วน)
+- **วิธีทำงาน:** แต่ละ milestone = 1 issue + อย่างน้อย 1 commit; อัปเดตสถานะในไฟล์นี้ทุกครั้ง;
+  ปิด issue เมื่อ milestone ผ่านเกณฑ์ตรวจของมันเอง
+
+## สถานะรวม
+
+| Milestone | Issue | สถานะ |
+|---|---|---|
+| M0 scaffold: repo + license + แผน + remote | — | ✅ เสร็จ |
+| M1 engine.io core: packet + payload codec | #1 | 🔲 รอทำ |
+| M2 session manager + polling transport | #2 | 🔲 รอทำ |
+| M3 websocket transport + upgrade dance | #3 | 🔲 รอทำ |
+| M4 engine.io compliance harness (official suite) | #4 | 🔲 รอทำ |
+| M5 socket.io parser v5 (text + binary attachments) | #5 | 🔲 รอทำ |
+| M6 socket.io server core: nsp/rooms/ack/broadcast | #6 | 🔲 รอทำ |
+| M7 public API + http.Handler wiring + e2e | #7 | 🔲 รอทำ |
+| M8 JS interop tests (socket.io-client v4 จริง) | #8 | 🔲 รอทำ |
+| M9 docs + example + สรุปสถานะ | #9 | 🔲 รอทำ |
+
+## รายละเอียดแต่ละ milestone
+
+### M0 — scaffold ✅
+
+git init, go.mod (`github.com/somprasongd/go-socketio-v4`, go 1.27), MIT LICENSE,
+.gitignore, Makefile, PLAN.md นี้, สร้าง remote repo ผ่าน `gh repo create` แล้ว push
+
+### M1 — engine.io core: packet + payload codec (issue #1)
+
+- `engineio/packet`: type 0-6 (open, close, ping, pong, message, upgrade, noop),
+  packet = `<type><data>`, message packet มีได้ทั้ง string และ binary
+- Payload codec สำหรับ polling: text คั่นด้วย `\x1e`, binary encode เป็น `b`+base64,
+  decode ทั้ง text-only และ mixed payload
+- Options: PingInterval=25s, PingTimeout=20s, MaxPayload=1MB (ตาม default ของ engine.io)
+- **เกณฑ์ตรวจ:** golden test byte-exact — handshake JSON, `2probe`/`3probe`,
+  encode/decode round-trip ทั้ง text/binary/mixed, edge case ตัวคั่น
+
+### M2 — session manager + polling transport (issue #2)
+
+- Handshake: GET → OPEN packet `{sid, upgrades, pingInterval, pingTimeout, maxPayload}`
+- Long-poll GET: ค้างรอ packet ใน buffer, ตอบทันทีเมื่อมีข้อมูล, หลาย GET พร้อมกันต้องไม่พัง
+- POST: decode payload → dispatch (ping→ตอบ pong, close→teardown, message→callback)
+- Heartbeat แบบ v4: client ping, server pong; ไม่ได้รับอะไรภายใน pingInterval+pingTimeout → ปิด session
+- maxPayload enforcement ทั้งรับและส่ง, session expiry เมื่อไม่มี transport ต่อเนื่อง
+- **เกณฑ์ตรวจ:** httptest — handshake round-trip, echo ผ่าน polling, ping/pong, session หมดอายุ
+
+### M3 — websocket transport + upgrade dance (issue #3)
+
+- ws transport: 1 frame ต่อ 1 packet (text frame = string, binary frame = binary)
+- Upgrade: client เปิด ws เพิ่มด้วย sid → `2probe` → `3probe` → `5` → server NOOP ช่อง polling เก่า แล้วสลับ
+- รองรับ ws-first (เชื่อมมาที่ transport=websocket โดยไม่มี sid ก็ได้)
+- **เกณฑ์ตรวจ:** test ด้วย gorilla client จริง — upgrade สำเร็จ, echo หลังสลับช่อง, heartbeat บน ws
+
+### M4 — engine.io compliance harness (issue #4)
+
+- `cmd/compliance-server`: echo server ผูกกับ library ของเรา ตั้งค่าตามที่ suite กำหนด
+  (pingInterval:300, pingTimeout:200, maxPayload:1e6)
+- รัน official test-suite ผ่าน Node ที่มีในเครื่อง; บันทึกวิธีรันใน README
+- **เกณฑ์ตรวจ:** suite ผ่าน หรือถ้า suite ติดขัดด้าน environment ให้เหลือ Go-side protocol
+  tests ครบ + บันทึกเหตุผลและวิธีรันชัดเจน
+
+### M5 — socket.io parser v5 (issue #5)
+
+- Packet types: 0 CONNECT, 1 DISCONNECT, 2 EVENT, 3 ACK, 4 CONNECT_ERROR,
+  5 BINARY_EVENT, 6 BINARY_ACK; format `<type>[<n>-][<nsp>,][<ack id>]<json>`
+- Binary: placeholder `{"_placeholder":true,"num":N}` + attachments ตามมาเป็น engine.io
+  packet แยก; ฝั่งส่งต้อง replace และแยก attachments ให้ถูก
+- **เกณฑ์ตรวจ:** table-driven test ใช้ตัวอย่างจาก spec ตรงตัว ทั้ง text และ binary
+
+### M6 — socket.io server core (issue #6)
+
+- Namespace: `/` + นอกจากนี้, connect handshake พร้อม auth payload, CONNECT_ERROR
+- Event dispatch, ack round-trip (ตอบ ACK งานที่ client ส่ง id มา + server emit แบบขอ ack)
+- Rooms: join/leave/broadcast.to/in, adapter interface + in-memory adapter
+- **เกณฑ์ตรวจ:** unit test ผ่าน fake engine.io conn — connect/auth, event+ack,
+  broadcast ตาม room, disconnect สะอาด
+
+### M7 — public API + wiring (issue #7)
+
+- Root package `socketio`: `New()`, OnConnect/OnDisconnect/OnEvent/OnError,
+  Socket.Emit/Join/Leave/Rooms/Broadcast/Disconnect, mount ที่ `/socket.io/`,
+  Close ด้วย context (shutdown สะอาด — จุดที่ googollee พังและเราออกแบบตั้งแต่ต้น)
+- **เกณฑ์ตรวจ:** e2e httptest ด้วย client จริงฝั่ง Go: connect → event → ack →
+  broadcast → disconnect; `go test -race` ผ่าน
+
+### M8 — JS interop tests (issue #8)
+
+- Node script ใช้ `socket.io-client` v4 จริง: connect (polling-first default), ws-only,
+  ack, binary ส่ง/รับ, broadcast, reconnect หลัง server ปิด-เปิด
+- รันผ่าน `go test` ที่ spawn node; ถ้าไม่มี node ให้ skip พร้อมเหตุผลชัดเจน
+- **เกณฑ์ตรวจ:** ผ่านด้วย node ในเครื่องนี้ (v24 มีอยู่จริง)
+
+### M9 — docs + example + สรุป (issue #9)
+
+- README: การติดตั้ง, ตัวอย่างใช้งาน, ตาราง protocol support, วิธีรัน compliance/interop tests
+- `cmd/example`: echo server สาธิต API
+- สรุปสถานะจริงทั้งหมดลง PLAN.md, tag v0.1.0
+- **เกณฑ์ตรวจ:** `go build ./... && go test ./... && go vet ./... && gofmt -l .` เขียวทั้งหมด
