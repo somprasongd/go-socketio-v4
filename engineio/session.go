@@ -43,13 +43,15 @@ type Session struct {
 	closed    bool
 	reason    CloseReason
 	polling   bool   // a long-poll GET is parked for this session
+	flushed   bool   // the transport switched away from polling; a parked poll retires with a noop
 	transport string // "polling" or "websocket"; a wsConn implies "websocket"
 	ws        wsConn // non-nil once the WebSocket transport took over
 	hbTimer   *time.Timer
 	hbArmed   time.Time // when the live timer was scheduled
 	lastRecv  time.Time
 
-	inbound chan inbound
+	inQ    []inbound // received Message packets waiting for the app
+	inCond *sync.Cond
 }
 
 // inbound is a Message packet handed to the application.
@@ -76,15 +78,16 @@ func newSessionID() string {
 }
 
 func newSession(srv *Server) *Session {
-	return &Session{
-		id:       newSessionID(),
-		srv:      srv,
-		wake:     make(chan struct{}, 1),
-		done:     make(chan struct{}),
+	s := &Session{
+		id:        newSessionID(),
+		srv:       srv,
+		wake:      make(chan struct{}, 1),
+		done:      make(chan struct{}),
 		transport: "polling",
-		inbound:  make(chan inbound, 32),
-		lastRecv: time.Now(),
+		lastRecv:  time.Now(),
 	}
+	s.inCond = sync.NewCond(&s.mu)
+	return s
 }
 
 // ID is the Engine.IO session id the client passes back on every request.
@@ -163,9 +166,9 @@ func (s *Session) closeLocked(reason CloseReason) {
 	default:
 	}
 	close(s.done)
-	// Ending the inbound channel is what retires the dispatch goroutine,
-	// which is where OnClose fires; without it a closed session leaks.
-	close(s.inbound)
+	// Waking the dispatcher is what retires it, and it is where OnClose
+	// fires; without this a closed session leaks the goroutine.
+	s.inCond.Broadcast()
 }
 
 func (s *Session) reasonLocked() CloseReason {
@@ -181,10 +184,10 @@ func (s *Session) handleIncomingLocked(p packet.Packet) {
 	case packet.Ping:
 		_ = s.sendLocked(packet.Packet{Type: packet.Pong, Data: p.Data})
 	case packet.Message:
-		// Safe as a plain send: callers hold the mutex and only call this
-		// for a live session, so closeLocked (which closes the channel)
-		// cannot run until the handler returns.
-		s.inbound <- inbound{data: p.Data, binary: p.Binary}
+		// Queueing never blocks (see dispatch), so packet handlers never
+		// sit on the mutex waiting for the application to keep up.
+		s.inQ = append(s.inQ, inbound{data: p.Data, binary: p.Binary})
+		s.inCond.Signal()
 	case packet.Close:
 		s.closeLocked(CloseTransport)
 	case packet.Upgrade, packet.Noop:
@@ -227,17 +230,30 @@ func (s *Session) checkHeartbeat() {
 }
 
 // dispatch runs for the session's lifetime, serialising callbacks so the
-// application never sees messages out of order.
+// application never sees messages out of order. Messages are delivered with
+// the mutex released: a handler that echoes back through Send would
+// otherwise deadlock against the packet handler holding the lock on a full
+// queue.
 func (s *Session) dispatch() {
-	for msg := range s.inbound {
+	s.mu.Lock()
+	for {
+		for len(s.inQ) == 0 && !s.closed {
+			s.inCond.Wait()
+		}
+		if len(s.inQ) == 0 {
+			break // closed and fully drained
+		}
+		msg := s.inQ[0]
+		s.inQ = s.inQ[1:]
+		s.mu.Unlock()
 		if fn := s.srv.OnMessage; fn != nil {
 			fn(s, msg.data, msg.binary)
 		} else {
 			s.srv.warnNoMessageHandler()
 		}
+		s.mu.Lock()
 	}
-	s.mu.Lock()
-	reason := s.reasonLocked()
+	reason := s.reason
 	s.mu.Unlock()
 	if fn := s.srv.OnClose; fn != nil {
 		fn(s, reason)

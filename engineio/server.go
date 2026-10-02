@@ -1,12 +1,10 @@
 package engineio
 
 import (
-	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
 	"sync"
-	"time"
 
 	"github.com/somprasongd/go-socketio-v4/engineio/packet"
 )
@@ -104,14 +102,7 @@ func (srv *Server) serveHandshake(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("transport") == "polling" {
 		upgrades = []string{"websocket"}
 	}
-	hs := packet.Handshake{
-		SID:          s.id,
-		Upgrades:     upgrades,
-		PingInterval: int(s.srv.opts.PingInterval / time.Millisecond),
-		PingTimeout:  int(s.srv.opts.PingTimeout / time.Millisecond),
-		MaxPayload:   s.srv.opts.MaxPayload,
-	}
-	body, err := json.Marshal(hs)
+	body, err := srv.handshakeBody(s, upgrades)
 	if err != nil {
 		http.Error(w, "handshake encode failed", http.StatusInternalServerError)
 		return
@@ -136,24 +127,27 @@ func (srv *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		if sid == "" {
-			if transport != "polling" && transport != "websocket" {
-				http.Error(w, "unknown transport", http.StatusBadRequest)
+		switch {
+		case sid == "" && transport == "websocket":
+			// A client may open a session straight on WebSocket, no
+			// polling handshake first.
+			srv.serveWebSocketRequest(w, r, "")
+		case sid == "" && transport == "polling":
+			srv.serveHandshake(w, r)
+		case sid != "":
+			s := srv.getSession(sid)
+			if s == nil {
+				http.Error(w, "unknown sid", http.StatusBadRequest)
 				return
 			}
-			srv.serveHandshake(w, r)
-			return
-		}
-		s := srv.getSession(sid)
-		if s == nil {
-			http.Error(w, "unknown sid", http.StatusBadRequest)
-			return
-		}
-		switch transport {
-		case "polling":
-			s.servePollingGet(w, r)
-		case "websocket":
-			s.serveWebSocket(w, r)
+			switch transport {
+			case "polling":
+				s.servePollingGet(w, r)
+			case "websocket":
+				srv.serveWebSocketRequest(w, r, sid)
+			default:
+				http.Error(w, "unknown transport", http.StatusBadRequest)
+			}
 		default:
 			http.Error(w, "unknown transport", http.StatusBadRequest)
 		}

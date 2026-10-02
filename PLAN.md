@@ -21,7 +21,7 @@ Socket.IO v4 + Engine.IO v4 server implementation สำหรับ Go — **�
 | M0 scaffold: repo + license + แผน + remote | — | ✅ เสร็จ |
 | M1 engine.io core: packet + payload codec | #1 | ✅ เสร็จ |
 | M2 session manager + polling transport | #2 | ✅ เสร็จ |
-| M3 websocket transport + upgrade dance | #3 | 🔲 รอทำ |
+| M3 websocket transport + upgrade dance | #3 | ✅ เสร็จ |
 | M4 engine.io compliance harness (official suite) | #4 | 🔲 รอทำ |
 | M5 socket.io parser v5 (text + binary attachments) | #5 | 🔲 รอทำ |
 | M6 socket.io server core: nsp/rooms/ack/broadcast | #6 | 🔲 รอทำ |
@@ -69,7 +69,16 @@ git init, go.mod (`github.com/somprasongd/go-socketio-v4`, go 1.27), MIT LICENSE
 - maxPayload enforcement ทั้งรับและส่ง, session expiry เมื่อไม่มี transport ต่อเนื่อง
 - **เกณฑ์ตรวจ:** httptest — handshake round-trip, echo ผ่าน polling, ping/pong, session หมดอายุ
 
-### M3 — websocket transport + upgrade dance (issue #3)
+### M3 — websocket transport + upgrade dance (issue #3) ✅
+
+> เสร็จ: `engineio/ws.go` — wsTransport (1 frame ต่อ 1 packet, writer token
+> กัน concurrent write), ws-only session (OPEN ส่งบน socket เลย), upgrade
+> dance (2probe→3probe→5 แล้วค่อยสลับ; probe ล้มเหลวไม่ฆ่า session เดิม),
+> ตอนสลับ forward packet ที่ค้างใน buf ออกทาง ws แล้วปลุก parked poll ให้
+> จบด้วย noop, polling หลังสลับ = protocol violation ปิด session
+> แก้ระหว่างทาง: inbound เปลี่ยนจาก channel เป็น queue+cond และ deliver
+> callback นอก lock เพื่อกัน deadlock กรณี handler echo กลับเข้า session
+> ตรวจแล้ว: 17 tests + `go test -race` เขียว (รวม upgrade/binary/failed-probe)
 
 - ws transport: 1 frame ต่อ 1 packet (text frame = string, binary frame = binary)
 - Upgrade: client เปิด ws เพิ่มด้วย sid → `2probe` → `3probe` → `5` → server NOOP ช่อง polling เก่า แล้วสลับ

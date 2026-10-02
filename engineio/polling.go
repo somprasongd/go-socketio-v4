@@ -56,9 +56,16 @@ func (s *Session) servePollingGet(w http.ResponseWriter, r *http.Request) {
 	for {
 		s.mu.Lock()
 		pkts := s.takeBufLocked()
+		flushed := s.flushed
 		s.mu.Unlock()
 		if len(pkts) > 0 {
 			writePollPayload(w, pkts)
+			return
+		}
+		if flushed {
+			// The session switched to WebSocket while this poll sat parked;
+			// retire it with a noop so the client drops the old channel.
+			writePollPayload(w, []packet.Packet{{Type: packet.Noop}})
 			return
 		}
 		select {

@@ -15,12 +15,13 @@ import (
 // harness wires a server to a real httptest listener and keeps the
 // callbacks' traffic on channels for deterministic assertions.
 type harness struct {
-	t  *testing.T
+	t   *testing.T
 	srv *Server
-	ts *httptest.Server
+	ts  *httptest.Server
 	url string
 
 	messages chan string
+	blobs    chan []byte
 	closed   chan CloseReason
 	sessions chan *Session
 }
@@ -31,10 +32,17 @@ func newHarness(t *testing.T, opts *Options) *harness {
 		t:        t,
 		srv:      NewServer(opts),
 		messages: make(chan string, 16),
+		blobs:    make(chan []byte, 16),
 		closed:   make(chan CloseReason, 4),
 		sessions: make(chan *Session, 4),
 	}
-	h.srv.OnMessage = func(s *Session, data []byte, _ bool) {
+	h.srv.OnMessage = func(s *Session, data []byte, isBinary bool) {
+		if isBinary {
+			h.blobs <- data
+			// echo, preserving the frame type the protocol tests assert on
+			_ = s.SendBinary(data)
+			return
+		}
 		h.messages <- string(data)
 		// echo, which is what the protocol tests below assert on
 		_ = s.SendText(string(data))
