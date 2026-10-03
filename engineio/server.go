@@ -24,7 +24,7 @@ var (
 type Server struct {
 	opts *Options
 
-	// OnSession runs after a session handshake completes.
+	// OnSession runs synchronously after the handshake and before dispatch.
 	OnSession func(*Session)
 	// OnMessage runs for every Message packet, in arrival order, on the
 	// session's dispatch goroutine. Each session is serialised
@@ -110,7 +110,7 @@ func (srv *Server) serveHandshake(w http.ResponseWriter, r *http.Request) {
 	writePollPayload(w, []packet.Packet{{Type: packet.Open, Data: body}})
 
 	if fn := srv.OnSession; fn != nil {
-		go fn(s)
+		fn(s)
 	}
 	go s.dispatch()
 }
@@ -119,6 +119,22 @@ func (srv *Server) serveHandshake(w http.ResponseWriter, r *http.Request) {
 func (srv *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if origin := r.Header.Get("Origin"); origin != "" && !srv.opts.allowsOrigin(origin) {
 		http.Error(w, "origin not allowed", http.StatusForbidden)
+		return
+	}
+	if origin := r.Header.Get("Origin"); origin != "" {
+		w.Header().Add("Vary", "Origin")
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		if srv.opts.AllowCredentials {
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+		}
+	}
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		if headers := r.Header.Get("Access-Control-Request-Headers"); headers != "" {
+			w.Header().Add("Vary", "Access-Control-Request-Headers")
+			w.Header().Set("Access-Control-Allow-Headers", headers)
+		}
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	q := r.URL.Query()

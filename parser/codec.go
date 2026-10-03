@@ -6,6 +6,9 @@ import (
 	"strings"
 )
 
+// MaxAttachments bounds binary reconstruction memory per packet.
+const MaxAttachments = 10
+
 // NeededAttachments reports how many binary attachments a text packet
 // expects, or -1 when the type carries none. Callers use it to know whether
 // the binary Engine.IO packets that follow are part of this packet.
@@ -45,7 +48,7 @@ func Decode(text string, attachments [][]byte) (Packet, error) {
 			return Packet{}, errf("%s is missing the attachment count", t)
 		}
 		n, err := strconv.Atoi(rest[:dash])
-		if err != nil || n != len(attachments) {
+		if err != nil || n < 0 || n > MaxAttachments || n != len(attachments) {
 			return Packet{}, errf("attachment count %q does not match the %d attachments given", rest[:dash], len(attachments))
 		}
 		rest = rest[dash+1:]
@@ -216,6 +219,9 @@ func Encode(p Packet) (string, [][]byte, error) {
 		args = trimmed
 	}
 
+	if len(attachments) > MaxAttachments {
+		return "", nil, errf("too many binary attachments (maximum %d)", MaxAttachments)
+	}
 	var b strings.Builder
 	if base == Event || base == Ack {
 		// the wire type gains a binary prefix only when lifting found bytes
@@ -255,39 +261,4 @@ func Encode(p Packet) (string, [][]byte, error) {
 	}
 
 	return b.String(), attachments, nil
-}
-
-// liftBinaries walks a value and replaces every []byte with a placeholder
-// marker, collecting the bytes as attachments in encounter order.
-func liftBinaries(node any, attachments *[][]byte, depth int) (any, error) {
-	if depth > 32 {
-		return nil, errf("args nested too deeply")
-	}
-	switch v := node.(type) {
-	case []byte:
-		num := len(*attachments)
-		*attachments = append(*attachments, v)
-		return map[string]any{"_placeholder": true, "num": float64(num)}, nil
-	case []any:
-		out := make([]any, len(v))
-		for i, item := range v {
-			stripped, err := liftBinaries(item, attachments, depth+1)
-			if err != nil {
-				return nil, err
-			}
-			out[i] = stripped
-		}
-		return out, nil
-	case map[string]any:
-		out := make(map[string]any, len(v))
-		for k, item := range v {
-			stripped, err := liftBinaries(item, attachments, depth+1)
-			if err != nil {
-				return nil, err
-			}
-			out[k] = stripped
-		}
-		return out, nil
-	}
-	return node, nil
 }

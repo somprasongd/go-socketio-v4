@@ -58,7 +58,7 @@ func TestDecodePacketGolden(t *testing.T) {
 }
 
 func TestDecodePacketErrors(t *testing.T) {
-	for _, in := range []string{"9", "7", "x", "b!!!"} {
+	for _, in := range []string{"", "9", "7", "x", "b!!!"} {
 		if _, err := DecodePacket(in); err == nil {
 			t.Errorf("DecodePacket(%q): expected error, got none", in)
 		}

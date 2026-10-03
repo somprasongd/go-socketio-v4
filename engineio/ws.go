@@ -14,12 +14,13 @@ import (
 // packets. Writes are serialised because gorilla connections do not tolerate
 // concurrent writers.
 type wsTransport struct {
-	conn *websocket.Conn
-	wmu  chan struct{} // writer token: one write at a time
+	conn         *websocket.Conn
+	wmu          chan struct{} // writer token: one write at a time
+	writeTimeout time.Duration
 }
 
-func newWSTransport(conn *websocket.Conn) *wsTransport {
-	t := &wsTransport{conn: conn, wmu: make(chan struct{}, 1)}
+func newWSTransport(conn *websocket.Conn, writeTimeout time.Duration) *wsTransport {
+	t := &wsTransport{conn: conn, wmu: make(chan struct{}, 1), writeTimeout: writeTimeout}
 	t.wmu <- struct{}{}
 	return t
 }
@@ -27,6 +28,9 @@ func newWSTransport(conn *websocket.Conn) *wsTransport {
 func (t *wsTransport) writePacket(p packet.Packet) error {
 	<-t.wmu
 	defer func() { t.wmu <- struct{}{} }()
+	if err := t.conn.SetWriteDeadline(time.Now().Add(t.writeTimeout)); err != nil {
+		return err
+	}
 	if p.Binary {
 		return t.conn.WriteMessage(websocket.BinaryMessage, p.Data)
 	}
@@ -54,7 +58,8 @@ func (srv *Server) serveWebSocketRequest(w http.ResponseWriter, r *http.Request,
 	if err != nil {
 		return // Upgrade already wrote the HTTP error
 	}
-	t := newWSTransport(conn)
+	conn.SetReadLimit(int64(srv.opts.MaxPayload))
+	t := newWSTransport(conn, srv.opts.WriteTimeout)
 
 	if sid == "" {
 		srv.serveWebSocketOnly(t)
@@ -66,7 +71,11 @@ func (srv *Server) serveWebSocketRequest(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	s.mu.Lock()
-	busy := s.ws != nil
+	busy := s.closed || s.ws != nil || s.probe != nil
+	if !busy {
+		s.probe = t
+		_ = conn.SetReadDeadline(time.Now().Add(srv.opts.PingInterval + srv.opts.PingTimeout))
+	}
 	s.mu.Unlock()
 	if busy {
 		// One WebSocket owns the session; a second connection with the same
@@ -105,7 +114,7 @@ func (srv *Server) serveWebSocketOnly(t *wsTransport) {
 	s.mu.Unlock()
 
 	if fn := srv.OnSession; fn != nil {
-		go fn(s)
+		fn(s)
 	}
 	go s.dispatch()
 	s.wsReadLoop(t, false)
@@ -128,6 +137,17 @@ func (srv *Server) handshakeBody(s *Session, upgrades []string) ([]byte, error) 
 // with an upgrade packet.
 func (s *Session) wsReadLoop(t *wsTransport, probing bool) {
 	upgraded := !probing
+	defer func() {
+		_ = t.close()
+		s.mu.Lock()
+		if s.probe == t {
+			s.probe = nil
+			if s.ws == nil {
+				s.flushed = false
+			}
+		}
+		s.mu.Unlock()
+	}()
 	for {
 		mt, data, err := t.conn.ReadMessage()
 		if err != nil {
@@ -148,17 +168,15 @@ func (s *Session) wsReadLoop(t *wsTransport, probing bool) {
 			_ = t.close()
 			return
 		}
-		if derr != nil {
+		if derr != nil || 1+len(p.Data) > s.srv.opts.MaxPayload {
 			s.closeLocked(CloseProtocol)
 			s.mu.Unlock()
 			_ = t.close()
 			return
 		}
-		s.lastRecv = time.Now()
-		s.armHeartbeatLocked()
 
 		switch {
-		case p.Type == packet.Ping:
+		case p.Type == packet.Ping && !upgraded && string(p.Data) == "probe":
 			s.mu.Unlock()
 			// Only valid as the upgrade probe on this socket: before the
 			// switch the session does not route anything through it. (A
@@ -197,7 +215,7 @@ func (s *Session) wsReadLoop(t *wsTransport, probing bool) {
 				return
 			}
 		case p.Type == packet.Pong && upgraded:
-			// The answer to the server's ping; refresh above is enough.
+			s.handleIncomingLocked(p)
 			s.mu.Unlock()
 		case p.Type == packet.Message && upgraded:
 			// Queueing never blocks, so the reader never sits on the mutex
@@ -221,9 +239,14 @@ func (s *Session) wsReadLoop(t *wsTransport, probing bool) {
 // retire with a noop so the client closes its old channel.
 func (s *Session) switchToWebSocketLocked(t *wsTransport) {
 	s.ws = t
+	s.probe = nil
+	_ = t.conn.SetReadDeadline(time.Time{})
 	s.transport = "websocket"
 	for _, p := range s.takeBufLocked() {
-		_ = t.writePacket(p)
+		if err := t.writePacket(p); err != nil {
+			s.closeLocked(CloseTransport)
+			break
+		}
 	}
 	s.flushed = true
 	select {

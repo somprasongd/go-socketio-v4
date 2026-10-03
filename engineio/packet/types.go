@@ -21,10 +21,10 @@ const (
 	Open Type = 0
 	// Close is sent by either side to end the session.
 	Close Type = 1
-	// Ping is sent by the client as the v4 heartbeat; v3 reversed the
-	// direction, so a server that answers instead of waiting is speaking v3.
+	// Ping is sent by the server as the v4 heartbeat (or by a probing
+	// client with payload "probe" before a transport upgrade).
 	Ping Type = 2
-	// Pong is the server's immediate answer to a Ping.
+	// Pong is the client's answer to a server heartbeat Ping.
 	Pong Type = 3
 	// Message carries application data: a text string or raw binary.
 	Message Type = 4

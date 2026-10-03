@@ -14,25 +14,30 @@ const (
 	DefaultPingInterval = 25 * time.Second
 	DefaultPingTimeout  = 20 * time.Second
 	DefaultMaxPayload   = 1_000_000
+	DefaultWriteTimeout = 5 * time.Second
 )
 
 // Options configure the server. Zero fields fall back to the defaults above.
 type Options struct {
-	// PingInterval is how often the client sends a Ping packet. Sent in the
+	// PingInterval is how often the server sends a Ping packet. Sent in the
 	// handshake in milliseconds.
 	PingInterval time.Duration
-	// PingTimeout is how long after a ping the client may stay silent.
-	// The server closes a session once PingInterval+PingTimeout pass with
-	// nothing received.
+	// PingTimeout is how long the server waits for the client's Pong.
 	PingTimeout time.Duration
 	// MaxPayload is the largest single packet accepted or sent, in bytes,
 	// matching engine.io's per-packet limit.
 	MaxPayload int
+	// WriteTimeout bounds each WebSocket write, including shutdown writes.
+	// Default 5 seconds. A failed write closes the transport.
+	WriteTimeout time.Duration
 	// AllowedOrigins lists the Origin header values allowed to open a
 	// connection. Empty, or a single "*", allows every origin — the
 	// engine.io default, right for loopback-only deployments. Anything
 	// else is refused with 403 on both polling and WebSocket.
 	AllowedOrigins []string
+	// AllowCredentials enables credentialed cross-origin polling responses.
+	// Allowed origins are reflected in the CORS response headers.
+	AllowCredentials bool
 }
 
 // allowsOrigin reports whether the given Origin header value may connect.
@@ -59,5 +64,9 @@ func (o *Options) withDefaults() *Options {
 	if d.MaxPayload <= 0 {
 		d.MaxPayload = DefaultMaxPayload
 	}
+	if d.WriteTimeout <= 0 {
+		d.WriteTimeout = DefaultWriteTimeout
+	}
+	d.AllowedOrigins = append([]string(nil), d.AllowedOrigins...)
 	return &d
 }

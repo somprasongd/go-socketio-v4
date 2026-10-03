@@ -38,6 +38,8 @@ jobs:
         run: go build ./...
       - name: Vet
         run: go vet ./...
+      - name: Test acceptance result gate
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
 
   tests:
     name: Race and distributed recovery
@@ -69,28 +71,10 @@ jobs:
       - name: Install JavaScript client
         run: npm ci --prefix interop
       - name: Run all tests with race detector
+        shell: bash
         run: go test -race -count=1 -timeout=5m -json ./... | tee test-results.json
       - name: Require interop and distributed tests to pass without skipping
-        run: |
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-
-          required = {
-              ("github.com/somprasongd/go-socketio-v4", "TestJSInterop"),
-              ("github.com/somprasongd/go-socketio-v4/redisstreamsadapter", "TestDistributedJSRecovery"),
-              ("github.com/somprasongd/go-socketio-v4/redisstreamsadapter", "TestRealRedisDisconnectResumeAndFailClosed"),
-          }
-          passed = set()
-          for line in Path("test-results.json").read_text().splitlines():
-              event = json.loads(line)
-              if event.get("Action") == "pass":
-                  passed.add((event.get("Package"), event.get("Test")))
-          missing = required - passed
-          if missing:
-              raise SystemExit("Required tests did not pass: " + ", ".join(sorted(test for _, test in missing)))
-          print("JavaScript interop and real Redis distributed tests all passed.")
-          PY
+        run: python3 .github/scripts/check_test_results.py test-results.json
 
   compliance:
     name: Engine.IO protocol compliance

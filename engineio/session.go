@@ -36,20 +36,20 @@ type Session struct {
 	id  string
 	srv *Server
 
-	mu        sync.Mutex
-	buf       []packet.Packet // outbound, waiting for the next parked poll
-	wake      chan struct{}   // releases the parked poll when buf grows
-	done      chan struct{}   // closed once, on session end
-	closed    bool
-	reason    CloseReason
-	polling   bool   // a long-poll GET is parked for this session
-	flushed   bool   // the transport switched away from polling; a parked poll retires with a noop
-	transport string // "polling" or "websocket"; a wsConn implies "websocket"
-	ws        wsConn // non-nil once the WebSocket transport took over
-	hbTimer   *time.Timer
-	hbArmed   time.Time // when the live ping timer was scheduled
-	pingSent  time.Time // when the current outstanding Ping left
-	lastRecv  time.Time
+	mu           sync.Mutex
+	buf          []packet.Packet // outbound, waiting for the next parked poll
+	wake         chan struct{}   // releases the parked poll when buf grows
+	done         chan struct{}   // closed once, on session end
+	closed       bool
+	reason       CloseReason
+	polling      bool   // a long-poll GET is parked for this session
+	flushed      bool   // the transport switched away from polling; a parked poll retires with a noop
+	transport    string // "polling" or "websocket"; a wsConn implies "websocket"
+	ws           wsConn // non-nil once the WebSocket transport took over
+	hbTimer      *time.Timer
+	hbGeneration uint64 // stale timer callbacks cannot alter a newer heartbeat
+	awaitingPong bool
+	probe        *wsTransport // the sole pending upgrade transport
 
 	inQ    []inbound // received Message packets waiting for the app
 	inCond *sync.Cond
@@ -85,7 +85,6 @@ func newSession(srv *Server) *Session {
 		wake:      make(chan struct{}, 1),
 		done:      make(chan struct{}),
 		transport: "polling",
-		lastRecv:  time.Now(),
 	}
 	s.inCond = sync.NewCond(&s.mu)
 	return s
@@ -133,7 +132,11 @@ func (s *Session) sendLocked(p packet.Packet) error {
 		return ErrPayloadTooLarge
 	}
 	if s.ws != nil {
-		return s.ws.writePacket(p)
+		err := s.ws.writePacket(p)
+		if err != nil {
+			s.closeLocked(CloseTransport)
+		}
+		return err
 	}
 	s.buf = append(s.buf, p)
 	select {
@@ -172,6 +175,9 @@ func (s *Session) closeLocked(reason CloseReason) {
 		s.hbTimer.Stop()
 	}
 	s.srv.removeSession(s)
+	if s.probe != nil {
+		_ = s.probe.close()
+	}
 	// Tell the client before tearing down. A client-initiated close needs
 	// no close packet — it knows — so its parked poll retires with a noop
 	// instead; every other reason delivers the close packet.
@@ -202,15 +208,16 @@ func (s *Session) reasonLocked() CloseReason {
 // handleIncoming processes one decoded packet from the client. Called with
 // the session mutex held by the polling/websocket handlers.
 func (s *Session) handleIncomingLocked(p packet.Packet) {
-	s.lastRecv = time.Now()
-	s.armHeartbeatLocked()
 	switch p.Type {
 	case packet.Ping:
 		// The server is the pinger in protocol v4; a client ping is stale
 		// v3 behaviour and means the peer is not who we think it is.
 		s.closeLocked(CloseProtocol)
 	case packet.Pong:
-		// The answer to our ping; the refresh above is all it needs.
+		// Only an outstanding server ping can be acknowledged.
+		if s.awaitingPong {
+			s.armHeartbeatLocked()
+		}
 	case packet.Message:
 		// Queueing never blocks (see dispatch), so packet handlers never
 		// sit on the mutex waiting for the application to keep up.
@@ -228,50 +235,37 @@ func (s *Session) handleIncomingLocked(p packet.Packet) {
 	}
 }
 
-// armHeartbeatLocked schedules the next server ping. The engine.io 6.4+
-// revision of protocol v4 has the server sending the Ping and the client
-// answering Pong — the reverse of v3 — so the timer is the pinger, and the
-// deadline only ever fires against real traffic timestamps.
+// armHeartbeatLocked starts the next ping interval after handshake or Pong.
+// Application messages never postpone the heartbeat or acknowledge a Ping.
 func (s *Session) armHeartbeatLocked() {
-	s.hbArmed = time.Now()
+	s.hbGeneration++
+	generation := s.hbGeneration
+	s.awaitingPong = false
 	if s.hbTimer != nil {
 		s.hbTimer.Stop()
 	}
-	s.hbTimer = time.AfterFunc(s.srv.opts.PingInterval, s.onPingDue)
+	s.hbTimer = time.AfterFunc(s.srv.opts.PingInterval, func() { s.onPingDue(generation) })
 }
 
-// onPingDue sends the Ping and starts the Pong deadline. A stale timer whose
-// session saw traffic in the meantime stands down: that traffic re-armed a
-// fresher one.
-func (s *Session) onPingDue() {
+func (s *Session) onPingDue(generation uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed || s.lastRecv.After(s.hbArmed) {
+	if s.closed || generation != s.hbGeneration || s.awaitingPong {
 		return
 	}
 	if err := s.sendLocked(packet.Packet{Type: packet.Ping}); err != nil {
 		return
 	}
-	s.pingSent = time.Now()
-	if s.hbTimer != nil {
-		s.hbTimer.Stop()
-	}
-	s.hbTimer = time.AfterFunc(s.srv.opts.PingTimeout, s.onPongDeadline)
+	s.awaitingPong = true
+	s.hbTimer = time.AfterFunc(s.srv.opts.PingTimeout, func() { s.onPongDeadline(generation) })
 }
 
-// onPongDeadline closes the session unless traffic arrived after the last
-// ping went out.
-func (s *Session) onPongDeadline() {
+func (s *Session) onPongDeadline(generation uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
-		return
+	if !s.closed && generation == s.hbGeneration && s.awaitingPong {
+		s.closeLocked(CloseTimeout)
 	}
-	if s.lastRecv.After(s.pingSent) {
-		s.armHeartbeatLocked()
-		return
-	}
-	s.closeLocked(CloseTimeout)
 }
 
 // dispatch runs for the session's lifetime, serialising callbacks so the

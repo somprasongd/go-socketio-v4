@@ -3,7 +3,7 @@
 A Socket.IO v4 server for Go, written from the official protocol
 specifications and validated against them — the official Engine.IO
 compliance suite (24/24 passing) and the real `socket.io-client` v4
-JavaScript client (11/11 interop scenarios passing).
+JavaScript client (19/19 interop scenarios passing).
 
 ## Install
 
@@ -11,7 +11,7 @@ JavaScript client (11/11 interop scenarios passing).
 go get github.com/somprasongd/go-socketio-v4
 ```
 
-The only dependency is `gorilla/websocket`.
+The transport uses `gorilla/websocket`; the Redis adapters use `go-redis/v9`.
 
 ## Quick start
 
@@ -60,19 +60,25 @@ s.To("readers").Emit("card", data)    // the room minus the sender
 s.Broadcast().Emit("ping")            // everyone except the sender
 ```
 
-Acked emits from the server:
+Acked emits from the server can use a caller deadline:
 
 ```go
-select {
-case res := <-s.EmitWithAck("ask-for-config"):
-	// the client answered; res holds the ack arguments
-case <-time.After(2 * time.Second):
-	// client never answered (or the socket died — the channel closes empty)
+ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+defer cancel()
+res, ok := <-s.EmitWithAckContext(ctx, "ask-for-config")
+if ok {
+    // the client answered; res holds the ack arguments
 }
 ```
 
+`EmitWithAck` remains available with a 30-second default timeout. Both APIs
+close their channel after one result, or empty on timeout, cancellation, send
+failure or namespace/transport disconnect. Acks are isolated by namespace.
+
 Binary values travel as protocol attachments automatically — pass `[]byte`
-anywhere in the args, at any depth:
+inside typed maps, slices, arrays, pointers and structs (JSON tags and custom
+marshalers are preserved), up to 32 nested levels. Packets support at most 10
+binary attachments; excessive or malformed inbound headers close the connection:
 
 ```go
 s.Emit("photo", map[string]any{"name": "x", "data": []byte{0x01, 0x02}})
@@ -97,6 +103,15 @@ ns.Use(func(s *socketio.Socket) error {
 	return nil
 })
 ```
+
+Cross-origin browser polling uses the same `AllowedOrigins` policy as WebSocket.
+Allowed origins receive CORS response headers and OPTIONS preflights are handled.
+Set `engineio.Options.AllowCredentials` when credentialed requests are required.
+The default still allows every origin; set an explicit allowlist for a restricted
+endpoint. `MaxPayload` applies to inbound WebSocket messages as well as polling;
+`WriteTimeout` bounds WebSocket writes and defaults to 5 seconds. A failed write
+closes the transport. Only Pong acknowledges a server heartbeat; application
+traffic never postpones Ping.
 
 Connection-state recovery keeps a session across an unexpected drop:
 
@@ -250,7 +265,8 @@ requests, and manual dispatch: build/vet/format/dependency verification;
 all Go tests with the race detector and a Redis 7.2 service; and official
 Engine.IO protocol compliance. The test job installs the JavaScript client
 and requires the interop and real Redis acceptance tests to pass explicitly,
-so missing dependencies or skipped integration tests cannot produce a green CI.
+so missing dependencies, skipped integration tests, unrelated test failures and
+race failures cannot produce a green CI. See [CHANGELOG.md](CHANGELOG.md) for releases.
 
 ## Why a rewrite
 

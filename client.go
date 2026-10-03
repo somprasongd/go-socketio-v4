@@ -1,6 +1,7 @@
 package socketio
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"log"
@@ -38,7 +39,7 @@ type client struct {
 
 	ackMu    sync.Mutex
 	ackNext  int64
-	ackWaits map[int64]chan []any
+	ackWaits map[int64]*ackWait
 }
 
 func newClient(srv *Server, sess sendSink) *client {
@@ -46,7 +47,7 @@ func newClient(srv *Server, sess sendSink) *client {
 		srv:      srv,
 		sess:     sess,
 		conns:    make(map[string]*Socket),
-		ackWaits: make(map[int64]chan []any),
+		ackWaits: make(map[int64]*ackWait),
 	}
 }
 
@@ -85,6 +86,18 @@ func (c *client) onMessage(data []byte, isBinary bool) {
 		return
 	default:
 		if n := parser.NeededAttachments(string(data)); n > 0 {
+			// Validate the header before accepting any attachments. Dummy slots
+			// let the parser validate JSON and placeholder references immediately.
+			if n > parser.MaxAttachments {
+				c.mu.Unlock()
+				c.kill(reasonParseError)
+				return
+			}
+			if _, err := parser.Decode(string(data), make([][]byte, n)); err != nil {
+				c.mu.Unlock()
+				c.kill(reasonParseError)
+				return
+			}
 			c.needBin, c.binText, c.bins = n, string(data), nil
 			c.mu.Unlock()
 			return
@@ -123,13 +136,14 @@ func (c *client) route(pkt parser.Packet) {
 		if !pkt.HasID {
 			return // nothing to match; ignore
 		}
+		c.mu.Lock()
+		s := c.conns[name]
 		c.ackMu.Lock()
-		wait := c.ackWaits[pkt.ID]
-		delete(c.ackWaits, pkt.ID)
-		c.ackMu.Unlock()
-		if wait != nil {
-			wait <- pkt.Args()
+		if wait := c.ackWaits[pkt.ID]; wait != nil && wait.socket == s && s != nil {
+			c.completeAckLocked(pkt.ID, pkt.Args(), true)
 		}
+		c.ackMu.Unlock()
+		c.mu.Unlock()
 	}
 }
 
@@ -292,6 +306,7 @@ func (c *client) routeDisconnect(name string) {
 		return
 	}
 	delete(c.conns, name)
+	c.cancelSocketAcks(s)
 	c.mu.Unlock()
 
 	s.ns.deliveryMu.Lock()
@@ -345,7 +360,16 @@ func (c *client) kill(reason string) {
 		conns = append(conns, s)
 	}
 	c.conns = map[string]*Socket{}
+	c.needBin, c.binText, c.bins = 0, "", nil
+	c.ackMu.Lock()
+	for id := range c.ackWaits {
+		c.completeAckLocked(id, nil, false)
+	}
+	c.ackMu.Unlock()
 	c.mu.Unlock()
+	if reason == reasonParseError {
+		c.sess.Close()
+	}
 	for _, s := range conns {
 		// snapshot the rooms while the adapter still knows them
 		s.ns.deliveryMu.Lock()
@@ -353,15 +377,8 @@ func (c *client) kill(reason string) {
 		s.ns.removeSocket(s)
 		s.ns.deliveryMu.Unlock()
 	}
-	c.ackMu.Lock()
-	waits := c.ackWaits
-	c.ackWaits = map[int64]chan []any{}
-	c.ackMu.Unlock()
 	c.srv.removeClient(c.sess)
 
-	for _, wait := range waits {
-		close(wait) // closed empty: the caller's wait sees a timeout
-	}
 	for _, s := range conns {
 		s.ns.fireDisconnect(s, reason)
 	}
@@ -407,12 +424,66 @@ func (c *client) nextAckID() int64 {
 	return c.ackNext
 }
 
-func (c *client) awaitAck(id int64) chan []any {
+// ackWait is owned by ackMu. Completion removes it before closing its channel.
+type ackWait struct {
+	socket *Socket
+	ch     chan []any
+	stop   func() bool
+	cancel context.CancelFunc
+}
+
+func (c *client) awaitAck(s *Socket, id int64, ctx context.Context, cancel context.CancelFunc) (chan []any, bool) {
+	ch := make(chan []any, 1)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed || c.conns[s.ns.name] != s || ctx.Err() != nil {
+		close(ch)
+		if cancel != nil {
+			cancel()
+		}
+		return ch, false
+	}
 	c.ackMu.Lock()
 	defer c.ackMu.Unlock()
-	wait := make(chan []any, 1)
+	wait := &ackWait{socket: s, ch: ch, cancel: cancel}
 	c.ackWaits[id] = wait
-	return wait
+	wait.stop = context.AfterFunc(ctx, func() { c.completeAck(id, nil, false) })
+	return ch, true
+}
+
+func (c *client) completeAck(id int64, args []any, answered bool) {
+	c.ackMu.Lock()
+	defer c.ackMu.Unlock()
+	c.completeAckLocked(id, args, answered)
+}
+
+func (c *client) completeAckLocked(id int64, args []any, answered bool) {
+	wait := c.ackWaits[id]
+	if wait == nil {
+		return
+	}
+	delete(c.ackWaits, id)
+	if wait.stop != nil {
+		wait.stop()
+	}
+	if wait.cancel != nil {
+		wait.cancel()
+	}
+	if answered {
+		wait.ch <- args
+	}
+	close(wait.ch)
+}
+
+// Caller holds c.mu, so a disconnected socket cannot register another waiter.
+func (c *client) cancelSocketAcks(s *Socket) {
+	c.ackMu.Lock()
+	defer c.ackMu.Unlock()
+	for id, wait := range c.ackWaits {
+		if wait.socket == s {
+			c.completeAckLocked(id, nil, false)
+		}
+	}
 }
 
 // newSocketID generates a namespace-connection id in socket.io's shape —

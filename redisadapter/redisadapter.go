@@ -20,6 +20,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	socketio "github.com/somprasongd/go-socketio-v4"
+	"github.com/somprasongd/go-socketio-v4/parser"
 )
 
 // Adapter is a socketio.Adapter backed by Redis pub/sub.
@@ -153,6 +154,17 @@ type binaryMarker struct {
 }
 
 func encodeArgs(args []any) ([]json.RawMessage, error) {
+	// Normalize typed containers through the common Socket.IO binary encoder,
+	// then preserve the existing Pub/Sub JSON marker format.
+	text, bins, err := parser.Encode(parser.Packet{Type: parser.Event, Data: append([]any{"relay"}, args...)})
+	if err != nil {
+		return nil, err
+	}
+	packet, err := parser.Decode(text, bins)
+	if err != nil {
+		return nil, err
+	}
+	args = packet.Args()[1:]
 	out := make([]json.RawMessage, len(args))
 	for i, arg := range args {
 		transformed := liftBinaryForJSON(arg)
