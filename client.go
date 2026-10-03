@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"log"
 	"sync"
-	"time"
 
 	"github.com/somprasongd/go-socketio-v4/parser"
 )
@@ -168,11 +167,16 @@ func (c *client) routeConnect(name string, pkt parser.Packet) {
 	// the session instead of starting over.
 	if st := ns.recoveryFields(); st != nil {
 		if pid, _ := auth["pid"].(string); pid != "" {
-			if entry := st.lookup(pid); entry != nil {
-				entry.mu.Lock()
-				disconnected := !entry.discAt.IsZero() && !entry.attached
-				entry.mu.Unlock()
-				if disconnected && c.recoverConnect(ns, entry, auth) {
+			offset, _ := auth["offset"].(string)
+			if backend := ns.recoveryBackend(); backend != nil {
+				if c.restoreExternal(ns, backend, pid, offset, auth) {
+					return
+				}
+			} else {
+				ns.deliveryMu.Lock()
+				entry := st.claim(pid, offset)
+				ns.deliveryMu.Unlock()
+				if entry != nil && c.recoverConnect(ns, entry, auth) {
 					return
 				}
 			}
@@ -186,11 +190,18 @@ func (c *client) routeConnect(name string, pkt parser.Packet) {
 	}
 	s := &Socket{id: newSocketID(), ns: ns, c: c, handshake: auth}
 	if st := ns.recoveryFields(); st != nil {
-		s.rec = st.start(s.id)
+		if ns.recoveryBackend() != nil {
+			s.rec = &recoveryEntry{pid: newRecoveryPID(), socketID: s.id, attached: true, external: true, maxEvents: st.opts.MaxBufferedEvents}
+		} else {
+			s.rec = st.start(s.id)
+		}
 	}
 	c.mu.Unlock()
 
 	if err := ns.runMiddlewares(s); err != nil {
+		if s.rec != nil {
+			ns.recoveryDrop(s.rec.pid)
+		}
 		c.sendPacket(parser.Packet{
 			Type:      parser.ConnectError,
 			Namespace: nsName(name),
@@ -199,14 +210,18 @@ func (c *client) routeConnect(name string, pkt parser.Packet) {
 		return
 	}
 
+	ns.deliveryMu.Lock()
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
+		ns.deliveryMu.Unlock()
+		if s.rec != nil {
+			ns.recoveryDrop(s.rec.pid)
+		}
 		return
 	}
 	c.conns[name] = s
 	c.mu.Unlock()
-
 	ns.addSocket(s)
 	reply := map[string]any{"sid": s.id}
 	if s.rec != nil {
@@ -217,6 +232,7 @@ func (c *client) routeConnect(name string, pkt parser.Packet) {
 		Namespace: nsName(name),
 		Data:      reply,
 	})
+	ns.deliveryMu.Unlock()
 	ns.fireConnect(s)
 }
 
@@ -224,62 +240,47 @@ func (c *client) routeConnect(name string, pkt parser.Packet) {
 // data, the connect reply carrying both ids, then the replay of the events
 // the client reported missing. Returns false when recovery cannot proceed,
 // leaving the caller to fall back to a fresh session.
+// Caller has atomically reserved entry. Middleware runs outside delivery locks.
 func (c *client) recoverConnect(ns *Namespace, entry *recoveryEntry, auth map[string]any) bool {
 	opts := ns.recoveryOpts()
-	if opts == nil {
-		return false
-	}
-	s := &Socket{
-		id:        entry.socketID,
-		ns:        ns,
-		c:         c,
-		handshake: auth,
-		rec:       entry,
-		recovered: true,
-	}
+	s := &Socket{id: entry.socketID, ns: ns, c: c, handshake: auth, rec: entry, recovered: true, restoring: true}
+	entry.mu.Lock()
 	s.data = entry.data
-
+	s.preparedRooms = preparedRooms(entry.rooms)
+	entry.mu.Unlock()
+	release := func() { entry.mu.Lock(); entry.claimed = false; entry.mu.Unlock() }
 	if !opts.SkipMiddlewares {
 		if err := ns.runMiddlewares(s); err != nil {
-			c.sendPacket(parser.Packet{
-				Type:      parser.ConnectError,
-				Namespace: nsName(ns.name),
-				Data:      map[string]any{"message": err.Error()},
-			})
-			return false
+			release()
+			_ = c.sendPacket(parser.Packet{Type: parser.ConnectError, Namespace: nsName(ns.name), Data: map[string]any{"message": err.Error()}})
+			return true
 		}
 	}
-
-	entry.mu.Lock()
-	entry.discAt = time.Time{}
-	entry.attached = true
-	entry.mu.Unlock()
-
+	ns.deliveryMu.Lock()
+	offset, _ := auth["offset"].(string)
+	if !entry.covers(offset, opts.MaxDisconnectionDuration) {
+		release()
+		ns.deliveryMu.Unlock()
+		return false
+	}
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
-		return false
+		release()
+		ns.deliveryMu.Unlock()
+		return true
 	}
 	c.conns[ns.name] = s
 	c.mu.Unlock()
-
+	entry.attach()
 	ns.addSocket(s)
-	for _, room := range entry.rooms {
-		ns.adapterOf().Add(s, room)
-	}
-	var offset string
-	if v, ok := auth["offset"].(string); ok {
-		offset = v
-	}
-	c.sendPacket(parser.Packet{
-		Type:      parser.Connect,
-		Namespace: nsName(ns.name),
-		Data:      map[string]any{"sid": s.id, "pid": entry.pid},
-	})
-	ns.fireConnect(s)
+	_ = c.sendPacket(parser.Packet{Type: parser.Connect, Namespace: nsName(ns.name), Data: map[string]any{"sid": s.id, "pid": entry.pid}})
 	for _, ev := range entry.replayAfter(offset) {
 		_ = c.sendEncoded(ev.text, ev.bins)
 	}
+	ns.deliveryMu.Unlock()
+	ns.fireConnect(s)
+	s.finishRestore()
 	return true
 }
 
@@ -293,8 +294,10 @@ func (c *client) routeDisconnect(name string) {
 	delete(c.conns, name)
 	c.mu.Unlock()
 
-	s.ns.removeSocket(s)
+	s.ns.deliveryMu.Lock()
 	s.finalizeEntry(reasonClientDisconnect)
+	s.ns.removeSocket(s)
+	s.ns.deliveryMu.Unlock()
 	s.ns.fireDisconnect(s, reasonClientDisconnect)
 }
 
@@ -342,17 +345,19 @@ func (c *client) kill(reason string) {
 		conns = append(conns, s)
 	}
 	c.conns = map[string]*Socket{}
+	c.mu.Unlock()
 	for _, s := range conns {
 		// snapshot the rooms while the adapter still knows them
+		s.ns.deliveryMu.Lock()
 		s.finalizeEntry(reason)
 		s.ns.removeSocket(s)
+		s.ns.deliveryMu.Unlock()
 	}
 	c.ackMu.Lock()
 	waits := c.ackWaits
 	c.ackWaits = map[int64]chan []any{}
 	c.ackMu.Unlock()
 	c.srv.removeClient(c.sess)
-	c.mu.Unlock()
 
 	for _, wait := range waits {
 		close(wait) // closed empty: the caller's wait sees a timeout

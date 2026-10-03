@@ -118,6 +118,83 @@ import "github.com/somprasongd/go-socketio-v4/redisadapter"
 ns.SetAdapter(redisadapter.New("/", rdb, "my-app-relay"))
 ```
 
+### Recovery with multiple processes
+
+The classic `redisadapter` uses Pub/Sub. Incoming broadcasts buffer events for
+held sessions on each receiving instance, but recovery still requires returning
+to the same process. Pub/Sub messages lost while an instance is disconnected
+from Redis cannot be replayed. Sticky routing alone does not fix that loss.
+
+Use the opt-in Streams adapter for recovery across instances (Redis 7.2+):
+
+```go
+import (
+    "context"
+    "log"
+
+    "github.com/redis/go-redis/v9"
+    "github.com/somprasongd/go-socketio-v4/redisstreamsadapter"
+)
+
+rdb := redis.NewClient(&redis.Options{
+    Addr: "localhost:6379",
+    ContextTimeoutEnabled: true,
+})
+ad, err := redisstreamsadapter.New(context.Background(), "/", rdb,
+    &redisstreamsadapter.Options{
+        Prefix: "my-app", // same on every instance of this deployment
+        OnError: func(err error) { log.Print(err) },
+    })
+if err != nil {
+    log.Fatal(err)
+}
+defer ad.Close() // Redis client lifecycle remains the caller's responsibility
+ns.SetAdapter(ad)
+ns.EnableRecovery(nil)
+```
+
+Configure every instance with the same deployment prefix, codec, retention and
+recovery limits. Every instance reads its namespace stream independently. Durable events receive
+a shared stream offset; disconnected sessions live in Redis with a TTL. A
+socket automatically joins its own ID room, so `ns.To(id).Volatile().Emit(...)`
+also targets an individual client across instances. Apps control room admission.
+
+Volatile events use an ephemeral channel and are never stored for recovery.
+Events with acknowledgements also carry no recovery offset and are not replayed.
+Direct acked emits remain local to the socket handle's process. Redis append
+failure stops delivery of that durable event: direct `Emit` returns an error,
+while namespace/room broadcasts report through `OnError`. That callback must
+return promptly and must not call back into the namespace, since delivery may
+hold its lock. Set `ContextTimeoutEnabled: true` on the supplied Redis client
+so operation deadlines also bound network I/O.
+
+`Options` defaults: stream length 100,000, read batch 100, read block 1 second,
+operation timeout 5 seconds. Block time must be shorter than operation timeout.
+Retention is an event count limit; tune it for your event rate and recovery
+window. Namespace keys are isolated by deployment prefix and namespace, with
+Redis hash tags keeping atomic session operations in one hash slot.
+
+`Socket.Data` uses JSON by default: a restored struct becomes a JSON object,
+and numbers use JSON decoding semantics. Supply `Options.DataCodec` with
+concurrency-safe `Encode(any) ([]byte, error)` and `Decode([]byte) (any, error)`
+methods to preserve application types. Encoding failure leaves the session
+unrecoverable and reports through `OnError`.
+
+Recovery validates a retained offset actually issued to the session. Expired
+sessions, trimmed history, concurrent claims, and replay exceeding
+`MaxBufferedEvents` start a fresh session (`Recovered() == false`). Keep an
+application resynchronization path for this case. Backend operational failures
+return a retryable CONNECT_ERROR instead of silently creating a fresh session.
+Middleware rejection returns only CONNECT_ERROR; CONNECT, replay, then
+`OnConnect` precede queued live delivery on successful restore.
+
+Persisted disconnected sessions survive a Go process restart. A process crash
+before the disconnect snapshot is saved is not covered. Redis durability and
+availability depend on its deployment configuration. The Redis data format is
+private to this Go library and does not interoperate with the JavaScript Redis
+adapter or emitter. HTTP polling still needs sticky routing for each live
+Engine.IO session, even when Socket.IO reconnect recovery is distributed.
+
 ## Protocol support
 
 | Layer | Feature | Status |
@@ -134,7 +211,9 @@ ns.SetAdapter(redisadapter.New("/", rdb, "my-app-relay"))
 | Socket.IO v4 | connection middleware (`ns.Use`) with the CONNECT auth payload | ✅ |
 | Socket.IO v4 | connection-state recovery (pid/offset, id+rooms+data restored, replay) | ✅ |
 | Socket.IO v4 | cross-process broadcasting (`redisadapter`) | ✅ |
-| Socket.IO v4 | volatile over cross-process relay, Redis-Streams recovery store | partial |
+| Socket.IO v4 | volatile over Redis Pub/Sub relay (including socket-ID rooms) | ✅ |
+| Socket.IO v4 | local recovery with Redis Pub/Sub (same instance, while subscribed) | ✅ |
+| Socket.IO v4 | cross-instance recovery with `redisstreamsadapter` | ✅ |
 
 Disconnect reasons reach `OnDisconnect` in socket.io's vocabulary:
 `io client disconnect`, `io server disconnect`, `transport close`,
@@ -146,6 +225,7 @@ Disconnect reasons reach `OnDisconnect` in socket.io's vocabulary:
 go test ./...            # unit + golden protocol tests + e2e + JS interop
 go test -race ./...      # the concurrency suites
 make compliance          # the official engine.io-protocol test suite (24/24)
+SOCKETIO_REDIS_ADDR=127.0.0.1:6379 make integration # owned disposable Redis 7.2+
 ```
 
 The interop tests need `node` (v18+) with `socket.io-client`; they skip with
@@ -153,6 +233,17 @@ an explicit reason when it is missing. `compliance/run.sh` runs the suite
 copied verbatim from
 [engine.io-protocol/test-suite](https://github.com/socketio/engine.io-protocol/tree/main/test-suite)
 against `cmd/compliance-server`.
+
+
+The distributed acceptance suite requires Node with `interop/node_modules`
+installed (`cd interop && npm ci`) and a disposable Redis endpoint. It launches
+three separate Go server processes and the real JavaScript client, checks both
+namespaces and binary replay, restarts the original process after a persisted
+disconnect, and interrupts one adapter's Redis connections through a local TCP
+proxy to verify stream resume and failed-append behavior. Without the environment
+variable, these integration tests explicitly skip; unit tests use miniredis.
+Tests use isolated prefixes and session TTLs; use an owned disposable instance,
+not a production endpoint.
 
 ## Why a rewrite
 

@@ -260,8 +260,34 @@ git init, go.mod (`github.com/somprasongd/go-socketio-v4`, go 1.27), MIT LICENSE
 - **interop เพิ่ม 4 scenario:** auth ผิด/ถูกผ่าน middleware,
   recovery ครบวงรอบ (seed → engine.close → fire ระหว่างหลุด → reconnect →
   recovered=true + replay + rooms คืน)
-- **ข้อจำกัดที่ยังเหลือ (documented):** volatile ยังไม่ทำงานข้าม process ใน
-  redis relay (drop rule เป็นของ local), recovery store เป็น in-memory
-  (ข้าม process ต้องใช้ adapter ที่ support เช่น Redis Streams — ยังไม่มี),
-  client JS จะเห็น offset เป็น arg ท้ายของทุก event เมื่อเปิด recovery
+- **ข้อจำกัดที่ยังเหลือ (documented):** volatile relay ส่ง flag ไปตัดสิน drop ที่ instance ปลายทางแล้ว;
+  classic Redis Pub/Sub recovery เป็น local ต่อ process และไม่ replay
+  ข้อความที่สูญหายระหว่าง subscription ขาด; distributed recovery ใช้
+  `redisstreamsadapter` แบบ opt-in (ดูผลทดสอบ/ข้อจำกัดด้านล่าง),
+  client JS จะเห็น offset เป็น arg ท้ายของ event ที่ recover ได้
+  (ไม่รวม volatile และ event ที่มี acknowledgement) เมื่อเปิด recovery
   (พฤติกรรมเดียวกับ socket.io ทางการ)
+
+
+### Distributed recovery follow-up — 2026-10-03
+
+- แก้ eligibility: volatile/acked events ไม่เก็บ offset/replay; ตรวจ coverage
+  ของ offset, claim แบบ atomic, capture state ก่อนถอด membership และ replay
+  ก่อน OnConnect/live delivery รวมทั้ง namespace/binary packets
+- Pub/Sub receive path ป้อนทั้ง live/held sessions ที่ instance ผู้รับ โดยไม่
+  buffer ซ้ำฝั่ง emitter; เพิ่ม readiness และ socket-ID room routing
+- เพิ่ม optional namespace-binding, record-publishing และ recovery backend
+  interfaces โดยรักษา Adapter/EnableRecovery/emit APIs เดิม
+- เพิ่ม Redis Streams adapter: XADD → XREAD แยก cursor ต่อ instance, shared
+  offset, snapshot TTL, token/lease claim 10 วินาที, finite replay fence และ
+  dedup; ไม่ใช้ consumer group เดียวร่วมกัน
+- Defaults: Redis 7.2+, stream cap 100,000, batch 100, block 1s, timeout 5s;
+  Socket.Data ใช้ JSON หรือ custom codec; append failure หยุดส่ง event นั้น
+- Acceptance: unit/regression tests และ Redis จริง + JS client บน 3 Go
+  subprocesses ทดสอบ B→C, /admin, rooms/data/identity/binary, exclusions,
+  ordered replay, process restart หลัง persist และ Redis connection resume
+- รัน acceptance ด้วย `SOCKETIO_REDIS_ADDR=<disposable endpoint> make integration`;
+  ถ้าไม่ตั้ง endpoint ชุดนี้ skip ชัดเจน ไม่ใช่หลักฐานผ่าน distributed tests
+- ข้อจำกัด: process crash ก่อน persist snapshot ไม่รับรอง recovery,
+  Redis retention/TTL/caps อาจทำให้ fallback เป็น session ใหม่; format ไม่
+  compatible กับ JS Redis adapter/emitter; ไม่ได้พิสูจน์ production/cluster HA

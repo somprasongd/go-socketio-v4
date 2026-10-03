@@ -228,10 +228,14 @@ func TestRoomsAndBroadcast(t *testing.T) {
 
 	f1 := newFakeSink(srv)
 	f1.clientSends("0")
+	first := srv.DefaultNamespace().FetchSockets()[0]
 	f2 := newFakeSink(srv)
 	f2.clientSends("0")
 
 	socks := srv.DefaultNamespace().FetchSockets()
+	if len(socks) == 2 && socks[0] != first {
+		socks[0], socks[1] = socks[1], socks[0]
+	}
 	if len(socks) != 2 {
 		t.Fatalf("sockets = %d, want 2", len(socks))
 	}

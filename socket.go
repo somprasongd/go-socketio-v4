@@ -1,6 +1,7 @@
 package socketio
 
 import (
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -17,8 +18,13 @@ type Socket struct {
 	rec       *recoveryEntry // nil unless recovery is enabled
 	recovered bool
 
-	mu   sync.Mutex
-	data any
+	eventMu       sync.Mutex
+	restoring     bool
+	pending       []RecoveryRecord
+	mu            sync.Mutex
+	data          any
+	accepted      bool
+	preparedRooms map[string]bool
 }
 
 // ID is the namespace-connection id, as also sent to the client in the
@@ -103,6 +109,16 @@ func (s *Socket) EmitWithAck(event string, args ...any) <-chan []any {
 // Join puts the socket in a room. Rooms are per-namespace and vanish when
 // empty.
 func (s *Socket) Join(room string) {
+	s.mu.Lock()
+	if !s.accepted {
+		if s.preparedRooms == nil {
+			s.preparedRooms = make(map[string]bool)
+		}
+		s.preparedRooms[room] = true
+		s.mu.Unlock()
+		return
+	}
+	s.mu.Unlock()
 	s.ns.adapterOf().Add(s, room)
 	if s.rec != nil {
 		s.rec.trackRoom(room, true)
@@ -111,16 +127,47 @@ func (s *Socket) Join(room string) {
 
 // Leave removes the socket from a room.
 func (s *Socket) Leave(room string) {
+	s.mu.Lock()
+	if !s.accepted {
+		if s.preparedRooms == nil {
+			s.preparedRooms = make(map[string]bool)
+		}
+		s.preparedRooms[room] = false
+		s.mu.Unlock()
+		return
+	}
+	s.mu.Unlock()
 	s.ns.adapterOf().Del(s, room)
 	if s.rec != nil {
 		s.rec.trackRoom(room, false)
 	}
 }
 
-// Rooms lists the rooms the socket is in (local rooms only under a
-// cross-process adapter).
+// Rooms lists local room membership. Middleware sees staged membership;
+// rejected connections are never registered in the adapter.
 func (s *Socket) Rooms() []string {
+	s.mu.Lock()
+	if !s.accepted {
+		rooms := make([]string, 0, len(s.preparedRooms))
+		for room, in := range s.preparedRooms {
+			if in {
+				rooms = append(rooms, room)
+			}
+		}
+		s.mu.Unlock()
+		sort.Strings(rooms)
+		return rooms
+	}
+	s.mu.Unlock()
 	return s.ns.adapterOf().SocketRooms(s)
+}
+
+func preparedRooms(rooms []string) map[string]bool {
+	result := make(map[string]bool, len(rooms))
+	for _, room := range rooms {
+		result[room] = true
+	}
+	return result
 }
 
 // Broadcast targets every socket of the namespace except this one.
@@ -148,12 +195,26 @@ func (s *Socket) Disconnect() {
 		})
 	}
 	c.mu.Unlock()
-	s.ns.removeSocket(s)
+	s.ns.deliveryMu.Lock()
 	s.finalizeEntry(reasonServerDisconnect)
+	s.ns.removeSocket(s)
+	s.ns.deliveryMu.Unlock()
 	s.ns.fireDisconnect(s, reasonServerDisconnect)
 }
 
 func (s *Socket) sendEvent(base parser.Type, event string, args []any, ackID int64, hasAck bool, volatile bool) error {
+	if !hasAck {
+		if publisher, ok := s.ns.adapterOf().(RecordPublisher); ok {
+			record, err := NewRecoveryRecord(s.ns.name, nil, nil, event, args, volatile)
+			if err != nil {
+				return err
+			}
+			record.SocketIDs = []string{s.ID()}
+			return publisher.PublishRecord(record)
+		}
+	}
+	s.eventMu.Lock()
+	defer s.eventMu.Unlock()
 	if volatile && !s.c.sess.Writable() {
 		// volatile: the client cannot take it this instant; let it go
 		return nil
@@ -165,7 +226,7 @@ func (s *Socket) sendEvent(base parser.Type, event string, args []any, ackID int
 	// With recovery enabled every event carries its offset as the last
 	// element of the data array — the wire contract the JS client uses to
 	// report back what it has processed.
-	if s.rec != nil {
+	if s.rec != nil && !s.rec.external && !volatile && !hasAck {
 		off := s.rec.stamp()
 		full = append(full, strconv.FormatInt(off, 10))
 		text, bins, err := parser.Encode(parser.Packet{
@@ -179,16 +240,20 @@ func (s *Socket) sendEvent(base parser.Type, event string, args []any, ackID int
 			return err
 		}
 		s.rec.remember(s.rec.maxEvents, recoveryEvent{offset: off, text: text, bins: bins})
-		return s.c.sendEncoded(text, bins)
+		return s.sendOrQueue(RecoveryRecord{Text: text, Bins: bins})
 	}
 
-	return s.c.sendPacket(parser.Packet{
+	text, bins, err := parser.Encode(parser.Packet{
 		Type:      base,
 		Namespace: nsName(s.ns.name),
 		ID:        ackID,
 		HasID:     hasAck,
 		Data:      full,
 	})
+	if err != nil {
+		return err
+	}
+	return s.sendOrQueue(RecoveryRecord{Text: text, Bins: bins, Volatile: volatile})
 }
 
 // finalizeEntry decides the fate of the recovery entry at disconnect time:
@@ -201,13 +266,22 @@ func (s *Socket) finalizeEntry(reason string) {
 	recoverable := reason == reasonTransportClose || reason == reasonPingTimeout || reason == reasonParseError
 	if !recoverable {
 		s.ns.recoveryDrop(s.rec.pid)
+		if backend := s.ns.recoveryBackend(); backend != nil {
+			s.ns.invalidateSession(s.rec.pid, backend)
+		}
 		return
 	}
 	s.rec.mu.Lock()
 	s.rec.discAt = time.Now()
+	s.rec.attached = false
 	s.rec.rooms = s.ns.adapterOf().SocketRooms(s)
 	s.rec.data = s.getData()
 	s.rec.mu.Unlock()
+	if backend := s.ns.recoveryBackend(); backend != nil {
+		s.ns.persistSession(s, backend)
+	} else if st := s.ns.recoveryFields(); st != nil {
+		st.purge()
+	}
 }
 
 // BroadcastTarget collects recipients for an emit. except holds socket ids.

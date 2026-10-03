@@ -211,6 +211,7 @@ func TestRecoverySkipMiddlewaresOption(t *testing.T) {
 	_ = json.Unmarshal([]byte(strings.TrimPrefix(reply, "0")), &payload)
 	pid := payload["pid"].(string)
 
+	_ = ns.FetchSockets()[0].Emit("seed")
 	srv.detach(f1, reasonTransportClose)
 
 	f2 := newFakeSink(srv)

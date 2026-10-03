@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 
@@ -29,8 +30,10 @@ type Adapter struct {
 	rdb   redis.UniversalClient
 	sub   *redis.PubSub
 
-	mu     sync.Mutex
-	closed bool
+	mu        sync.Mutex
+	closed    bool
+	namespace *socketio.Namespace
+	readyErr  error
 }
 
 // relayMessage is the wire format on the pub/sub channel.
@@ -54,6 +57,9 @@ func New(nsp string, rdb redis.UniversalClient, channel string) *Adapter {
 		rdb:   rdb,
 	}
 	a.sub = rdb.Subscribe(context.Background(), channel)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_, a.readyErr = a.sub.Receive(ctx)
+	cancel()
 	go a.loop()
 	return a
 }
@@ -77,7 +83,14 @@ func (a *Adapter) loop() {
 		for _, id := range relay.Except {
 			except[id] = struct{}{}
 		}
-		socketio.DeliverLocal(a.local.Members(relay.Rooms), except, relay.Volatile, relay.Event, args)
+		a.mu.Lock()
+		ns := a.namespace
+		a.mu.Unlock()
+		if ns != nil {
+			ns.DeliverBroadcast(relay.Rooms, relay.Event, args, except, relay.Volatile)
+		} else {
+			socketio.DeliverLocal(a.local.Members(relay.Rooms), except, relay.Volatile, relay.Event, args)
+		}
 	}
 }
 
@@ -206,3 +219,9 @@ func lowerBinaryFromJSON(node any) any {
 	}
 	return node
 }
+
+// BindNamespace routes incoming events through local recovery as well as live delivery.
+func (a *Adapter) BindNamespace(ns *socketio.Namespace) { a.mu.Lock(); a.namespace = ns; a.mu.Unlock() }
+
+// Ready reports whether the initial Redis subscription was established.
+func (a *Adapter) Ready() error { return a.readyErr }

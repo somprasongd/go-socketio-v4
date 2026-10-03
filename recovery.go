@@ -64,11 +64,15 @@ type recoveryEntry struct {
 	rooms    []string
 	data     any
 
-	offset    int64
-	buffer    []recoveryEvent
-	maxEvents int
-	discAt    time.Time // zero while the session is connected
-	attached  bool      // a live Socket is using this entry right now
+	offset        int64
+	buffer        []recoveryEvent
+	maxEvents     int
+	external      bool
+	lastOffset    string
+	issuedOffsets []string
+	discAt        time.Time // zero while the session is connected
+	claimed       bool
+	attached      bool // a live Socket is using this entry right now
 }
 
 // newRecoveryPID generates the private session id.
@@ -97,7 +101,7 @@ func newRecoveryStore(opts *RecoveryOptions) *recoveryStore {
 // start creates a fresh entry for a new socket.
 func (st *recoveryStore) start(socketID string) *recoveryEntry {
 	st.purge()
-	e := &recoveryEntry{pid: newRecoveryPID(), socketID: socketID, maxEvents: st.opts.MaxBufferedEvents}
+	e := &recoveryEntry{pid: newRecoveryPID(), socketID: socketID, maxEvents: st.opts.MaxBufferedEvents, attached: true}
 	st.mu.Lock()
 	st.entries[e.pid] = e
 	st.mu.Unlock()
@@ -127,19 +131,31 @@ func (st *recoveryStore) purge() {
 	defer st.mu.Unlock()
 	for pid, e := range st.entries {
 		e.mu.Lock()
-		expired := !e.discAt.IsZero() && now.Sub(e.discAt) > st.opts.MaxDisconnectionDuration
+		expired := !e.attached && !e.claimed && !e.discAt.IsZero() && now.Sub(e.discAt) > st.opts.MaxDisconnectionDuration
 		e.mu.Unlock()
 		if expired {
 			delete(st.entries, pid)
 		}
 	}
-	for len(st.entries) > st.opts.MaxSessions {
+	heldCount := 0
+	for _, e := range st.entries {
+		e.mu.Lock()
+		if !e.attached && !e.claimed && !e.discAt.IsZero() {
+			heldCount++
+		}
+		e.mu.Unlock()
+	}
+	for heldCount > st.opts.MaxSessions {
 		oldestPID := ""
 		var oldest time.Time
 		for pid, e := range st.entries {
 			e.mu.Lock()
 			at := e.discAt
+			active := e.attached || e.claimed
 			e.mu.Unlock()
+			if active {
+				continue
+			}
 			if oldestPID == "" || at.Before(oldest) {
 				oldestPID, oldest = pid, at
 			}
@@ -148,6 +164,7 @@ func (st *recoveryStore) purge() {
 			break
 		}
 		delete(st.entries, oldestPID)
+		heldCount--
 	}
 }
 
@@ -174,7 +191,7 @@ func (e *recoveryEntry) trackRoom(room string, in bool) {
 // broadcastToHeld buffers an event for every disconnected session whose
 // rooms match — this is how events fired during the gap reach a client on
 // replay. Held sessions cannot receive volatile events by definition.
-func (st *recoveryStore) broadcastToHeld(rooms []string, event string, args []any, except map[string]struct{}, volatile bool) {
+func (st *recoveryStore) broadcastToHeld(namespace string, rooms []string, event string, args []any, except map[string]struct{}, volatile bool) {
 	if volatile {
 		return
 	}
@@ -217,12 +234,12 @@ func (st *recoveryStore) broadcastToHeld(rooms []string, event string, args []an
 		full = append(full, event)
 		full = append(full, args...)
 		full = append(full, strconv.FormatInt(off, 10))
-		text, bins, err := parser.Encode(parser.Packet{Type: parser.Event, Data: full})
+		text, bins, err := parser.Encode(parser.Packet{Type: parser.Event, Namespace: nsName(namespace), Data: full})
 		if err != nil {
 			e.mu.Unlock()
 			continue
 		}
-		e.buffer = append(e.buffer, recoveryEvent{offset: off, text: text, bins: bins})
+		e.buffer = append(e.buffer, recoveryEvent{offset: off, text: text, bins: copyAttachments(bins)})
 		if over := len(e.buffer) - e.maxEvents; over > 0 {
 			e.buffer = e.buffer[over:]
 		}
@@ -253,6 +270,7 @@ func (e *recoveryEntry) stamp() int64 {
 
 // remember files the encoded wire form into the replay buffer.
 func (e *recoveryEntry) remember(max int, ev recoveryEvent) {
+	ev.bins = copyAttachments(ev.bins)
 	e.mu.Lock()
 	e.buffer = append(e.buffer, ev)
 	if over := len(e.buffer) - max; over > 0 {
@@ -279,4 +297,59 @@ func (e *recoveryEntry) replayAfter(clientOffset string) []recoveryEvent {
 		}
 	}
 	return out
+}
+
+// claim validates coverage and reserves an entry. Caller holds namespace deliveryMu.
+func (st *recoveryStore) claim(pid, offset string) *recoveryEntry {
+	e := st.lookup(pid)
+	if e == nil {
+		return nil
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.attached || e.claimed || e.discAt.IsZero() {
+		return nil
+	}
+	last, err := strconv.ParseInt(offset, 10, 64)
+	if err != nil || last <= 0 {
+		return nil
+	}
+	found := false
+	for _, ev := range e.buffer {
+		if ev.offset == last {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return nil
+	}
+	e.claimed = true
+	return e
+}
+
+func (e *recoveryEntry) covers(offset string, window time.Duration) bool {
+	last, err := strconv.ParseInt(offset, 10, 64)
+	if err != nil || last <= 0 {
+		return false
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.discAt.IsZero() || time.Since(e.discAt) > window {
+		return false
+	}
+	for _, event := range e.buffer {
+		if event.offset == last {
+			return true
+		}
+	}
+	return false
+}
+
+func copyAttachments(bins [][]byte) [][]byte {
+	result := make([][]byte, len(bins))
+	for i, bin := range bins {
+		result[i] = append([]byte(nil), bin...)
+	}
+	return result
 }

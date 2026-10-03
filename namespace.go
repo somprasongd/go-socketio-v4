@@ -23,8 +23,9 @@ type Namespace struct {
 	srv  *Server
 	name string // "/" or "/admin" style
 
-	mu      sync.RWMutex
-	adapter Adapter
+	deliveryMu sync.Mutex // serializes delivery, detach and restore
+	mu         sync.RWMutex
+	adapter    Adapter
 
 	recovery *recoveryStore // nil until EnableRecovery
 
@@ -53,6 +54,9 @@ func (ns *Namespace) SetAdapter(a Adapter) {
 	ns.mu.Lock()
 	ns.adapter = a
 	ns.mu.Unlock()
+	if bound, ok := a.(NamespaceBinder); ok {
+		bound.BindNamespace(ns)
+	}
 }
 
 // EnableRecovery turns on connection-state recovery for this namespace:
@@ -174,9 +178,26 @@ func (ns *Namespace) Emit(event string, args ...any) {
 // broadcast delivers through the adapter and, when recovery is on, files
 // the event for held sessions that match the rooms.
 func (ns *Namespace) broadcast(rooms []string, event string, args []any, except map[string]struct{}, volatile bool) {
-	ns.adapterOf().Broadcast(rooms, event, args, except, volatile)
+	a := ns.adapterOf()
+	if publisher, ok := a.(RecordPublisher); ok {
+		record, err := NewRecoveryRecord(ns.name, rooms, except, event, args, volatile)
+		if err == nil {
+			err = publisher.PublishRecord(record)
+		}
+		if err != nil {
+			publisher.ReportError(err)
+		}
+		return
+	}
+	if _, ok := a.(NamespaceBinder); ok {
+		a.Broadcast(rooms, event, args, except, volatile)
+		return
+	}
+	ns.deliveryMu.Lock()
+	defer ns.deliveryMu.Unlock()
+	a.Broadcast(rooms, event, args, except, volatile)
 	if st := ns.recoveryFields(); st != nil {
-		st.broadcastToHeld(rooms, event, args, except, volatile)
+		st.broadcastToHeld(ns.name, rooms, event, args, except, volatile)
 	}
 }
 
@@ -201,6 +222,22 @@ func (ns *Namespace) target(rooms []string, except map[string]struct{}) *Broadca
 
 func (ns *Namespace) addSocket(s *Socket) {
 	ns.adapterOf().AddSocket(s)
+	s.mu.Lock()
+	s.accepted = true
+	staged := s.preparedRooms
+	s.preparedRooms = nil
+	s.mu.Unlock()
+	if s.rec != nil {
+		s.rec.mu.Lock()
+		s.rec.rooms = nil
+		s.rec.mu.Unlock()
+	}
+	for room, in := range staged {
+		if in {
+			s.Join(room)
+		}
+	}
+	s.Join(s.ID())
 }
 
 func (ns *Namespace) removeSocket(s *Socket) {
@@ -238,4 +275,19 @@ func (ns *Namespace) fireEvent(s *Socket, event string, args []any, ack func(res
 		return
 	}
 	fn(s, args, ack)
+}
+
+// NamespaceBinder lets a relay apply incoming broadcasts to live and held sessions.
+// BindNamespace must be called before serving clients, by SetAdapter.
+type NamespaceBinder interface{ BindNamespace(*Namespace) }
+
+// DeliverBroadcast applies a received Pub/Sub broadcast exactly once locally.
+// Relay adapters must use this instead of DeliverLocal when bound to a namespace.
+func (ns *Namespace) DeliverBroadcast(rooms []string, event string, args []any, except map[string]struct{}, volatile bool) {
+	ns.deliveryMu.Lock()
+	defer ns.deliveryMu.Unlock()
+	DeliverLocal(ns.adapterOf().Members(rooms), except, volatile, event, args)
+	if st := ns.recoveryFields(); st != nil {
+		st.broadcastToHeld(ns.name, rooms, event, args, except, volatile)
+	}
 }
