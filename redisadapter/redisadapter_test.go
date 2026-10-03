@@ -105,35 +105,36 @@ func readUntil(t *testing.T, c *websocket.Conn, substr string) string {
 	return ""
 }
 
-// frameScanner runs one background reader on the connection and reports
-// text frames on its channel — gorilla forbids reads after any read error,
-// so negative assertions must not read inline.
-func frameScanner(c *websocket.Conn) <-chan string {
-	frames := make(chan string, 16)
-	go func() {
-		defer close(frames)
-		for {
-			mt, data, err := c.ReadMessage()
-			if err != nil {
-				return
+// readForbiddenFrame consumes the whole observation window, rather than
+// treating the first unrelated frame as proof that a broadcast was excluded.
+// A timeout ends the Gorilla reader; these negative checks are the client's
+// final operation and callers must not reuse the connection afterward.
+func readForbiddenFrame(c *websocket.Conn, substr string, window time.Duration) (bool, error) {
+	if err := c.SetReadDeadline(time.Now().Add(window)); err != nil {
+		return false, err
+	}
+	for {
+		mt, data, err := c.ReadMessage()
+		if err != nil {
+			if timeout, ok := err.(interface{ Timeout() bool }); ok && timeout.Timeout() {
+				return false, nil
 			}
-			if mt == websocket.TextMessage {
-				frames <- string(data)
-			}
+			return false, err
 		}
-	}()
-	return frames
+		if mt == websocket.TextMessage && strings.Contains(string(data), substr) {
+			return true, nil
+		}
+	}
 }
 
-// assertNoFrameWith fails the test if a text frame containing substr shows
-// up within the window.
 func assertNoFrameWith(t *testing.T, c *websocket.Conn, substr string, window time.Duration) {
 	t.Helper()
-	for frame := range frameScanner(c) {
-		if strings.Contains(frame, substr) {
-			t.Fatalf("unexpected frame arrived: %q", frame)
-		}
-		return
+	found, err := readForbiddenFrame(c, substr, window)
+	if err != nil {
+		t.Fatalf("reading exclusion window: %v", err)
+	}
+	if found {
+		t.Fatalf("unexpected frame containing %q", substr)
 	}
 }
 
@@ -354,5 +355,37 @@ func TestRemoteBroadcastBuffersHeldSession(t *testing.T) {
 	frame := readText(t, next)
 	if !strings.Contains(frame, "after-replay") {
 		t.Fatalf("duplicate replay: %s", frame)
+	}
+}
+
+func TestNegativeWindowDetectsForbiddenFrameAfterUnrelatedFrame(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer rdb.Close()
+	in := startInstance(t, rdb, "/")
+	c := wsConnect(t, in, "")
+	in.srv.DefaultNamespace().Emit("barrier")
+	in.srv.DefaultNamespace().Emit("secret-leak")
+	found, err := readForbiddenFrame(c, "secret-leak", time.Second)
+	if err != nil || !found {
+		t.Fatalf("late forbidden frame missed: found=%v err=%v", found, err)
+	}
+}
+
+func TestTypedBinarySurvivesPubSubEncoding(t *testing.T) {
+	args, err := encodeArgs([]any{map[string][]byte{"data": {1, 2, 3}}, [][]byte{{4}, {5}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := decodeArgs(args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data, ok := decoded[0].(map[string]any)["data"].([]byte); !ok || !bytes.Equal(data, []byte{1, 2, 3}) {
+		t.Fatal(decoded)
+	}
+	chunks := decoded[1].([]any)
+	if !bytes.Equal(chunks[0].([]byte), []byte{4}) || !bytes.Equal(chunks[1].([]byte), []byte{5}) {
+		t.Fatal(decoded)
 	}
 }

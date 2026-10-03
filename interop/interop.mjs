@@ -186,5 +186,29 @@ check("connect websocket-only", true);
   control.disconnect();
 }
 
+// Typed Go containers must arrive as actual binary attachments.
+{
+  const typed = once(socket, "typed-result", "typed binary");
+  socket.connect();
+  await once(socket, "connect", "typed reconnect");
+  socket.emit("typed-binary");
+  const [value] = await typed;
+  check("typed Go binary containers preserve attachments", Buffer.from(value.chunks[0]).equals(Buffer.from([1, 2])) && Buffer.from(value.chunks[1]).equals(Buffer.from([3, 4])));
+  socket.disconnect();
+}
+
+// Application traffic must not postpone the server's heartbeat.
+{
+  const busy = io(process.env.INTEROP_HEARTBEAT_URL, { transports: ["websocket"], reconnection: false });
+  await once(busy, "connect", "busy heartbeat connect");
+  let pings = 0;
+  busy.io.engine.on("ping", () => pings++);
+  const timer = setInterval(() => busy.emit("tick"), 5);
+  await sleep(400);
+  clearInterval(timer);
+  check("continuous client traffic keeps receiving server pings", busy.connected && pings >= 3, `connected=${busy.connected}, pings=${pings}`);
+  busy.disconnect();
+}
+
 console.log(results.every((r) => r.ok) ? "ALL INTEROP TESTS PASSED" : "INTEROP FAILURES PRESENT");
 process.exit(results.every((r) => r.ok) ? 0 : 1);

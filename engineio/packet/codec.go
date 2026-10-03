@@ -75,6 +75,9 @@ func DecodePayload(data []byte) ([]Packet, error) {
 }
 
 func decodePiece(piece []byte) (Packet, error) {
+	if len(piece) == 0 {
+		return Packet{}, fmt.Errorf("engineio/packet: empty packet")
+	}
 	switch piece[0] {
 	case 'b':
 		raw, err := base64.StdEncoding.DecodeString(string(piece[1:]))

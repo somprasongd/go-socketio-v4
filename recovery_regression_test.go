@@ -251,3 +251,35 @@ func TestRecoveryBinaryBufferOwnsAttachments(t *testing.T) {
 		t.Fatalf("borrowed mutable replay buffer: %q", next.drain())
 	}
 }
+
+func TestStaleDisconnectCannotRemoveRecoveredSocket(t *testing.T) {
+	srv := newServer()
+	ns := srv.DefaultNamespace()
+	ns.EnableRecovery(nil)
+	f := newFakeSink(srv)
+	connectClient(t, f)
+	_, pid := recoveryIdentity(t, f)
+	old := ns.FetchSockets()[0]
+	_ = old.Emit("seed")
+	srv.detach(f, reasonTransportClose)
+	next := newFakeSink(srv)
+	next.clientSends(`0{"pid":"` + pid + `","offset":"1"}`)
+	current := ns.FetchSockets()[0]
+	if !current.Recovered() {
+		t.Fatal("recovery failed")
+	}
+	disconnects := 0
+	ns.OnDisconnect(func(*Socket, string) { disconnects++ })
+	old.Disconnect()
+	if sockets := ns.FetchSockets(); len(sockets) != 1 || sockets[0] != current {
+		t.Fatal("stale handle removed current socket")
+	}
+	if disconnects != 0 || ns.recoveryLookup(pid) == nil {
+		t.Fatal("stale handle changed recovery lifecycle")
+	}
+	current.Disconnect()
+	current.Disconnect()
+	if disconnects != 1 {
+		t.Fatalf("disconnect fired %d times", disconnects)
+	}
+}

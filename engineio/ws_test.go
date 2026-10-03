@@ -69,8 +69,8 @@ func TestWebSocketOnlySession(t *testing.T) {
 
 	writeText(t, c, "2beat")
 	_, text, _ = readFrame(t, c)
-	if text != "3beat" {
-		t.Errorf("ping answered %q, want %q", text, "3beat")
+	if text != "1" {
+		t.Errorf("client ping response %q, want protocol close 1", text)
 	}
 }
 

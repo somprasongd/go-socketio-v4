@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/somprasongd/go-socketio-v4/engineio"
 )
 
 // TestJSInterop runs the real socket.io v4 JavaScript client against the Go
@@ -87,6 +89,17 @@ func TestJSInterop(t *testing.T) {
 		s.Emit("welcome", "admin here")
 	})
 
+	ns.OnEvent("typed-binary", func(s *Socket, _ []any, _ func(...any)) {
+		_ = s.Emit("typed-result", &struct {
+			Chunks [][]byte `json:"chunks"`
+		}{Chunks: [][]byte{{1, 2}, {3, 4}}})
+	})
+	heartbeatSrv := New(&engineio.Options{PingInterval: 60 * time.Millisecond, PingTimeout: 80 * time.Millisecond})
+	heartbeatSrv.DefaultNamespace().OnEvent("tick", func(*Socket, []any, func(...any)) {})
+	heartbeatTS := httptest.NewServer(heartbeatSrv)
+	defer heartbeatTS.Close()
+	defer heartbeatSrv.EngineIO().Close()
+
 	// A second server enforces credentials through connection middleware —
 	// the auth path must be observable from the real client.
 	authSrv := New(nil)
@@ -107,7 +120,7 @@ func TestJSInterop(t *testing.T) {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, node, "interop.mjs")
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "INTEROP_URL="+ts.URL, "INTEROP_AUTH_URL="+authTS.URL)
+	cmd.Env = append(os.Environ(), "INTEROP_URL="+ts.URL, "INTEROP_AUTH_URL="+authTS.URL, "INTEROP_HEARTBEAT_URL="+heartbeatTS.URL)
 	out, err := cmd.CombinedOutput()
 	t.Logf("interop output:\n%s", out)
 	if err != nil {

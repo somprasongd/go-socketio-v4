@@ -1,6 +1,7 @@
 package socketio
 
 import (
+	"context"
 	"sort"
 	"strconv"
 	"sync"
@@ -85,23 +86,32 @@ func (v *VolatileSocket) Emit(event string, args ...any) error {
 	return v.s.sendEvent(parser.Event, event, args, 0, false, true)
 }
 
-// EmitWithAck sends an event and expects the client to answer. The returned
-// channel yields exactly one result — the client's ack arguments — and is
-// then closed; if the socket dies or the client never answers, it closes
-// empty and the caller's timeout (or ctx) decides. Suggested use:
-//
-//	select {
-//	case res := <-ch: use res
-//	case <-time.After(2 * time.Second): give up
-//	}
+// DefaultAckTimeout bounds EmitWithAck when no caller context is supplied.
+const DefaultAckTimeout = 30 * time.Second
+
+// EmitWithAck sends an event and waits at most DefaultAckTimeout for one ack.
+// The channel closes after the result, or empty on timeout, send failure or
+// namespace/transport disconnect. Use EmitWithAckContext for a caller deadline.
 func (s *Socket) EmitWithAck(event string, args ...any) <-chan []any {
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultAckTimeout)
+	return s.emitWithAck(ctx, cancel, event, args...)
+}
+
+// EmitWithAckContext sends an event and waits until the context is canceled,
+// the socket disconnects, or the client answers. Cancellation removes the
+// pending waiter and closes the channel empty. A successful ack yields one
+// result and then closes the channel.
+func (s *Socket) EmitWithAckContext(ctx context.Context, event string, args ...any) <-chan []any {
+	return s.emitWithAck(ctx, nil, event, args...)
+}
+
+func (s *Socket) emitWithAck(ctx context.Context, cancel context.CancelFunc, event string, args ...any) <-chan []any {
 	id := s.c.nextAckID()
-	wait := s.c.awaitAck(id)
-	if err := s.sendEvent(parser.Event, event, args, id, true, false); err != nil {
-		s.c.ackMu.Lock()
-		delete(s.c.ackWaits, id)
-		s.c.ackMu.Unlock()
-		close(wait)
+	wait, registered := s.c.awaitAck(s, id, ctx, cancel)
+	if registered {
+		if err := s.sendEvent(parser.Event, event, args, id, true, false); err != nil {
+			s.c.completeAck(id, nil, false)
+		}
 	}
 	return wait
 }
@@ -187,13 +197,16 @@ func (s *Socket) To(room string) *BroadcastTarget {
 func (s *Socket) Disconnect() {
 	c := s.c
 	c.mu.Lock()
-	if c.conns[s.ns.name] == s {
-		delete(c.conns, s.ns.name)
-		c.sendPacket(parser.Packet{
-			Type:      parser.Disconnect,
-			Namespace: nsName(s.ns.name),
-		})
+	if c.conns[s.ns.name] != s {
+		c.mu.Unlock()
+		return
 	}
+	delete(c.conns, s.ns.name)
+	c.cancelSocketAcks(s)
+	c.sendPacket(parser.Packet{
+		Type:      parser.Disconnect,
+		Namespace: nsName(s.ns.name),
+	})
 	c.mu.Unlock()
 	s.ns.deliveryMu.Lock()
 	s.finalizeEntry(reasonServerDisconnect)
