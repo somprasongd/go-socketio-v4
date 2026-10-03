@@ -245,6 +245,13 @@ variable, these integration tests explicitly skip; unit tests use miniredis.
 Tests use isolated prefixes and session TTLs; use an owned disposable instance,
 not a production endpoint.
 
+GitHub Actions runs these checks on pushes to `main`, version tags, pull
+requests, and manual dispatch: build/vet/format/dependency verification;
+all Go tests with the race detector and a Redis 7.2 service; and official
+Engine.IO protocol compliance. The test job installs the JavaScript client
+and requires the interop and real Redis acceptance tests to pass explicitly,
+so missing dependencies or skipped integration tests cannot produce a green CI.
+
 ## Why a rewrite
 
 The Go ecosystem had no maintained Socket.IO v4 server: `googollee/go-socket.io`

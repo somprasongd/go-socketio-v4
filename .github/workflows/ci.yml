@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  checks:
+    name: Go checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Check formatting
+        run: |
+          files=$(gofmt -l .)
+          if [ -n "$files" ]; then
+            printf '%s\n' "$files"
+            exit 1
+          fi
+      - name: Verify dependencies
+        run: go mod verify
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+
+  tests:
+    name: Race and distributed recovery
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      redis:
+        image: redis:7.2-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      SOCKETIO_REDIS_ADDR: 127.0.0.1:6379
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: interop/package-lock.json
+      - name: Install JavaScript client
+        run: npm ci --prefix interop
+      - name: Run all tests with race detector
+        run: go test -race -count=1 -timeout=5m -json ./... | tee test-results.json
+      - name: Require interop and distributed tests to pass without skipping
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          required = {
+              ("github.com/somprasongd/go-socketio-v4", "TestJSInterop"),
+              ("github.com/somprasongd/go-socketio-v4/redisstreamsadapter", "TestDistributedJSRecovery"),
+              ("github.com/somprasongd/go-socketio-v4/redisstreamsadapter", "TestRealRedisDisconnectResumeAndFailClosed"),
+          }
+          passed = set()
+          for line in Path("test-results.json").read_text().splitlines():
+              event = json.loads(line)
+              if event.get("Action") == "pass":
+                  passed.add((event.get("Package"), event.get("Test")))
+          missing = required - passed
+          if missing:
+              raise SystemExit("Required tests did not pass: " + ", ".join(sorted(test for _, test in missing)))
+          print("JavaScript interop and real Redis distributed tests all passed.")
+          PY
+
+  compliance:
+    name: Engine.IO protocol compliance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: compliance/package-lock.json
+      - name: Install protocol suite dependencies
+        run: npm ci --prefix compliance
+      - name: Run official Engine.IO protocol suite
+        run: make compliance
